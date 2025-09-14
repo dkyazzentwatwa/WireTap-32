@@ -917,7 +917,7 @@ void handleInputStream(Stream& s) {
 void setup() {
     // Disable watchdog during setup (commented out to avoid WDT errors)
     // disableCore0WDT();
-    
+    Wire.begin(21, 22);
     USB.begin(115200);
     delay(2000); // Longer delay for stability
     
