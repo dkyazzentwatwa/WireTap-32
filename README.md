@@ -32,6 +32,18 @@ A feature-rich, single-file ESP32 implementation of the classic Bus Pirate proto
 - **Context Prompts**: Shows current mode in prompt (I2C>, SPI>, etc.)
 - **Progress Indicators**: Visual feedback for long operations
 
+## Project Gallery
+
+<p align="center">
+  <img src="img/IMG_4145.JPG" alt="ESP32 Bus Pirate Setup" width="400"/>
+  <img src="img/IMG_4146.JPG" alt="OLED Display in Action" width="400"/>
+</p>
+
+<p align="center">
+  <img src="img/IMG_4147.JPG" alt="Hardware Configuration" width="400"/>
+  <img src="img/IMG_4148.JPG" alt="Serial Terminal Interface" width="400"/>
+</p>
+
 ## Hardware Requirements
 
 ### Basic Setup
