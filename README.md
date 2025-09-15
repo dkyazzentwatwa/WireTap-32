@@ -1,4 +1,4 @@
-# ESP32 Bus Pirate - Serial Terminal Edition
+# WireTap-32 - ESP32 Mini Bus Pirate
 
 A feature-rich, single-file ESP32 implementation of the classic Bus Pirate protocol analyzer. This version provides a stable, serial-only interface with optional OLED display support for embedded protocol debugging and analysis.
 
@@ -216,19 +216,12 @@ ESP32_BusPirate_Stable.ino    # Main source file
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache-2.0 license - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
 - Inspired by the original [Bus Pirate](http://dangerousprototypes.com/docs/Bus_Pirate) by Dangerous Prototypes
 - Built on the [Arduino ESP32 Core](https://github.com/espressif/arduino-esp32)
 - Uses [Adafruit graphics libraries](https://github.com/adafruit/Adafruit_SSD1306) for display support
-
-## Support
-
-- 📖 [Command Reference](https://github.com/yourusername/ESP32_BusPirate_Stable/wiki)
-- 🐛 [Issue Tracker](https://github.com/yourusername/ESP32_BusPirate_Stable/issues)
-- 💬 [Discussions](https://github.com/yourusername/ESP32_BusPirate_Stable/discussions)
-
 ---
 **⚡ Happy Protocol Debugging! ⚡**
