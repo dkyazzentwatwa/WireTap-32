@@ -1,4 +1,4 @@
-# ESP32 Bus Pirate - Serial Terminal Edition
+# WireTap-32 - ESP32 Mini Bus Pirate
 
 A feature-rich, single-file ESP32 implementation of the classic Bus Pirate protocol analyzer. This version provides a stable, serial-only interface with optional OLED display support for embedded protocol debugging and analysis.
 
