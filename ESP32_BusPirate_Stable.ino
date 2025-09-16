@@ -7,6 +7,9 @@
 #include <Wire.h>
 #include <SPI.h>
 #include <vector>
+#include <deque>
+#include <algorithm>
+#include <esp_system.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -65,9 +68,43 @@ int PIN_I2C_SDA = 21, PIN_I2C_SCL = 22;
 int PIN_SPI_MOSI = 23, PIN_SPI_MISO = 19, PIN_SPI_SCK = 18, PIN_SPI_CS = 5;
 int PIN_UART_TX = 17, PIN_UART_RX = 16;
 uint32_t UART_BAUD = 115200;
+uint32_t UART_CONFIG = SERIAL_8N1;
 uint32_t I2C_FREQ = 100000;
 uint32_t SPI_FREQ = 1000000;
+uint8_t SPI_MODE_CFG = SPI_MODE0;
+uint8_t SPI_BIT_ORDER = MSBFIRST;
 bool I2C_PULLUPS = true;
+
+// -------- Mode state helpers --------
+bool uartBridgeActive = false;
+bool uartSpamActive = false;
+unsigned long uartSpamNext = 0;
+String uartSpamPayload = "";
+uint32_t uartSpamPeriod = 0;
+
+bool i2cMonitorActive = false;
+uint8_t i2cMonitorAddr = 0;
+uint8_t i2cMonitorReg = 0;
+uint32_t i2cMonitorInterval = 500;
+unsigned long i2cMonitorNext = 0;
+std::vector<uint8_t> i2cMonitorCache;
+
+std::deque<String> i2cSlaveLog;
+bool i2cSlaveMode = false;
+unsigned long i2cSlaveEnd = 0;
+uint8_t i2cSlaveAddress = 0x00;
+uint8_t i2cSlaveTxValue = 0x00;
+
+// Forward declarations
+void serviceUARTRx();
+void serviceI2CSlave();
+void i2cMonitorStop(bool silent = false);
+void i2cSlaveStop(bool silent = false);
+std::vector<String> parseMacroTokens(const String& raw);
+bool readLineBlocking(String promptText, String& out, unsigned long timeoutMs = 0);
+std::vector<String> tok(const String& s);
+std::vector<uint8_t> parseHexBytes(const std::vector<String>& v, size_t start);
+bool parseHexByteToken(const String& token, uint8_t& value);
 
 // -------- UART target --------
 HardwareSerial TargetUART(2);
@@ -278,6 +315,8 @@ void setHiZ() {
     printInfo("Setting Hi-Z mode...");
 
     // End peripherals safely
+    i2cMonitorStop(true);
+    if(i2cSlaveMode) i2cSlaveStop(true);
     Wire.end();
     SPI.end();
     TargetUART.end();
@@ -403,6 +442,481 @@ void i2cRead(uint8_t addr, size_t n) {
     }
 }
 
+bool i2cDevicePresent(uint8_t addr) {
+    Wire.beginTransmission(addr);
+    return Wire.endTransmission() == 0;
+}
+
+void i2cPing(uint8_t addr) {
+    bool ok = i2cDevicePresent(addr);
+    if(ok) {
+        printSuccess("I2C PING 0x" + String(addr, HEX) + " -> ACK");
+    } else {
+        printError("I2C PING 0x" + String(addr, HEX) + " -> NACK");
+    }
+}
+
+String i2cGuessDevice(uint8_t addr) {
+    if(addr == 0x3C || addr == 0x3D) return "Likely SSD1306/SH1106 OLED";
+    if(addr >= 0x50 && addr <= 0x57) return "Likely 24xx EEPROM";
+    if(addr == 0x68) return "Likely DS3231 RTC or MPU-6050";
+    if(addr == 0x76 || addr == 0x77) return "Likely BME280/BMP280 sensor";
+    if(addr == 0x20 || addr == 0x21) return "Likely MCP23017 IO expander";
+    if(addr == 0x40) return "Likely INA219/Si7021 sensor";
+    return "Unknown device";
+}
+
+void i2cIdentify(uint8_t addr) {
+    if(!i2cDevicePresent(addr)) {
+        printError("I2C IDENTIFY: Address 0x" + String(addr, HEX) + " not responding");
+        return;
+    }
+
+    printSuccess("I2C IDENTIFY 0x" + String(addr, HEX) + "");
+    printInfo("  Guess: " + i2cGuessDevice(addr));
+
+    // Attempt to read two bytes for signature if possible
+    Wire.beginTransmission(addr);
+    Wire.write(0x00);
+    if(Wire.endTransmission(false) == 0) {
+        uint8_t got = Wire.requestFrom((int)addr, 2);
+        if(got > 0) {
+            uint8_t a = Wire.read();
+            uint8_t b = (got > 1) ? Wire.read() : 0xFF;
+            printData("  Peek: 0x" + String(a, HEX) + " 0x" + String(b, HEX));
+        }
+    }
+}
+
+bool i2cReadRegister(uint8_t addr, uint8_t reg, size_t len, std::vector<uint8_t>& out, bool verbose = true) {
+    out.clear();
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    if(Wire.endTransmission(false) != 0) {
+        if(verbose) printError("I2C READ REG failed to write register 0x" + String(reg, HEX));
+        return false;
+    }
+
+    uint8_t received = Wire.requestFrom((int)addr, (int)len);
+    unsigned long timeout = millis() + 200;
+    while(Wire.available() && out.size() < len && millis() < timeout) {
+        out.push_back(Wire.read());
+    }
+
+    if(out.empty()) {
+        if(verbose) printWarning("I2C READ REG 0x" + String(addr, HEX) + " -> no data");
+        return false;
+    }
+
+    if(verbose) {
+        printSuccess("I2C READ REG 0x" + String(addr, HEX) + "[0x" + String(reg, HEX) + "] " + String(out.size()) + "B");
+        printData("  Hex: " + toHex(out.data(), out.size()));
+    }
+    return true;
+}
+
+bool i2cRequest(uint8_t addr, size_t len, std::vector<uint8_t>& out) {
+    out.clear();
+    uint8_t got = Wire.requestFrom((int)addr, (int)len);
+    unsigned long timeout = millis() + 200;
+    while(Wire.available() && out.size() < len && millis() < timeout) {
+        out.push_back(Wire.read());
+    }
+    if(out.empty()) {
+        printWarning("I2C READ <- 0x" + String(addr, HEX) + " [no data]");
+        return false;
+    }
+    printData("I2C READ <- " + toHex(out.data(), out.size()));
+    return true;
+}
+
+void i2cWriteRegister(uint8_t addr, uint8_t reg, const std::vector<uint8_t>& values) {
+    Wire.beginTransmission(addr);
+    uint8_t written = Wire.write(reg);
+    if(!values.empty()) {
+        written += Wire.write(values.data(), values.size());
+    }
+    uint8_t rc = Wire.endTransmission();
+
+    String hexValues = values.empty() ? "" : toHex(values.data(), values.size());
+    printInfo("I2C WRITE REG 0x" + String(addr, HEX) + "[0x" + String(reg, HEX) + "] " + hexValues);
+    if(rc == 0 && written == values.size() + 1) printSuccess("  Result: SUCCESS");
+    else printError("  Result: ERROR " + String(rc));
+}
+
+void i2cDump(uint8_t addr, size_t len) {
+    if(len == 0 || len > 512) len = 256;
+    printInfo("I2C DUMP 0x" + String(addr, HEX) + " len=" + String(len));
+    for(size_t offset = 0; offset < len; offset += 16) {
+        size_t chunk = min((size_t)16, len - offset);
+        Wire.beginTransmission(addr);
+        Wire.write((uint8_t)(offset & 0xFF));
+        if(Wire.endTransmission(false) != 0) {
+            printError("  Failed to set address pointer at 0x" + String(offset, HEX));
+            break;
+        }
+
+        uint8_t got = Wire.requestFrom((int)addr, (int)chunk);
+        std::vector<uint8_t> data;
+        while(got-- && Wire.available()) data.push_back(Wire.read());
+
+        if(data.empty()) {
+            printWarning("  No data at 0x" + String(offset, HEX));
+            break;
+        }
+
+        String line = "  0x" + String(offset, HEX) + ": " + toHex(data.data(), data.size());
+        printData(line);
+        safeYield();
+    }
+}
+
+void i2cFlood(uint8_t addr, size_t count) {
+    if(count == 0) count = 32;
+    printWarning("Starting I2C flood on 0x" + String(addr, HEX) + " for " + String(count) + " iterations");
+    for(size_t i = 0; i < count; i++) {
+        uint8_t value = (uint8_t)esp_random();
+        Wire.beginTransmission(addr);
+        Wire.write((uint8_t)(i & 0xFF));
+        Wire.write(value);
+        uint8_t rc = Wire.endTransmission();
+        if(rc != 0) {
+            printError("  Flood stopped at iteration " + String(i) + " rc=" + String(rc));
+            break;
+        }
+        safeYield();
+    }
+    printSuccess("I2C flood complete");
+}
+
+void i2cInjectGlitches(uint8_t addr, size_t count) {
+    if(count == 0) count = 8;
+    printWarning("Injecting " + String(count) + " glitch pulses targeting 0x" + String(addr, HEX));
+
+    Wire.end();
+    delay(2);
+
+    pinMode(PIN_I2C_SDA, OUTPUT);
+    pinMode(PIN_I2C_SCL, OUTPUT);
+    digitalWrite(PIN_I2C_SDA, HIGH);
+    digitalWrite(PIN_I2C_SCL, HIGH);
+    delayMicroseconds(5);
+
+    for(size_t i = 0; i < count; i++) {
+        digitalWrite(PIN_I2C_SDA, LOW);
+        delayMicroseconds(2);
+        digitalWrite(PIN_I2C_SCL, LOW);
+        delayMicroseconds(2);
+        digitalWrite(PIN_I2C_SCL, HIGH);
+        delayMicroseconds(2);
+        digitalWrite(PIN_I2C_SDA, HIGH);
+        delayMicroseconds(2);
+    }
+
+    pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+    pinMode(PIN_I2C_SCL, INPUT_PULLUP);
+    delay(2);
+
+    i2cBegin();
+}
+
+void i2cRecoverBus() {
+    printWarning("Attempting I2C bus recovery (16 clock pulses + STOP)");
+    Wire.end();
+    delay(5);
+
+    pinMode(PIN_I2C_SCL, OUTPUT);
+    pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+    digitalWrite(PIN_I2C_SCL, HIGH);
+    delay(1);
+
+    for(int i = 0; i < 16; i++) {
+        digitalWrite(PIN_I2C_SCL, LOW);
+        delayMicroseconds(5);
+        digitalWrite(PIN_I2C_SCL, HIGH);
+        delayMicroseconds(5);
+    }
+
+    // Create a STOP condition manually
+    pinMode(PIN_I2C_SDA, OUTPUT);
+    digitalWrite(PIN_I2C_SDA, LOW);
+    delayMicroseconds(5);
+    digitalWrite(PIN_I2C_SCL, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(PIN_I2C_SDA, HIGH);
+    delayMicroseconds(5);
+
+    pinMode(PIN_I2C_SDA, INPUT);
+    pinMode(PIN_I2C_SCL, INPUT);
+
+    i2cBegin();
+}
+
+void i2cMonitorStart(uint8_t addr, uint8_t reg, size_t watchLen, uint32_t interval) {
+    i2cMonitorActive = true;
+    i2cMonitorAddr = addr;
+    i2cMonitorReg = reg;
+    i2cMonitorInterval = std::max<uint32_t>(interval, 50);
+    i2cMonitorCache.assign(std::max<size_t>(1, watchLen), 0);
+    i2cMonitorNext = 0;
+    printInfo("I2C monitor started for 0x" + String(addr, HEX) + " reg 0x" + String(reg, HEX) + " every " + String(i2cMonitorInterval) + "ms");
+}
+
+void i2cMonitorStop(bool silent) {
+    if(i2cMonitorActive) {
+        i2cMonitorActive = false;
+        if(!silent) printWarning("I2C monitor stopped");
+    }
+}
+
+void serviceI2CMonitor() {
+    if(!i2cMonitorActive) return;
+    unsigned long now = millis();
+    if(now < i2cMonitorNext) return;
+    i2cMonitorNext = now + i2cMonitorInterval;
+
+    std::vector<uint8_t> buf;
+    if(!i2cReadRegister(i2cMonitorAddr, i2cMonitorReg, std::max<size_t>(1, i2cMonitorCache.size()), buf, false)) {
+        return;
+    }
+
+    if(i2cMonitorCache != buf) {
+        printHeader("I2C monitor change @" + String((double)millis()/1000.0, 3) + "s");
+        printData("  New: " + toHex(buf.data(), buf.size()));
+        i2cMonitorCache = buf;
+    }
+}
+
+void i2cConfigCmd(const std::vector<String>& v) {
+    if(v.size() < 3) {
+        println("Usage: i2c config <option> <value>");
+        println("Options: freq <hz>, pullups on|off, pins <sda> <scl>");
+        return;
+    }
+
+    String opt = v[2];
+    opt.toLowerCase();
+    if(opt == "freq" && v.size() >= 4) {
+        uint32_t hz = constrain((uint32_t)strtoul(v[3].c_str(), nullptr, 10), 10000, 4000000);
+        I2C_FREQ = hz;
+        printSuccess("I2C frequency set to " + String(I2C_FREQ) + "Hz");
+        if(mode == I2C_MODE) i2cBegin();
+        return;
+    }
+    if(opt == "pullups" && v.size() >= 4) {
+        I2C_PULLUPS = (v[3] == "on" || v[3] == "1" || v[3] == "true");
+        printSuccess(String("I2C pullups ") + (I2C_PULLUPS ? "enabled" : "disabled"));
+        if(mode == I2C_MODE) i2cBegin();
+        return;
+    }
+    if(opt == "pins" && v.size() >= 5) {
+        PIN_I2C_SDA = v[3].toInt();
+        PIN_I2C_SCL = v[4].toInt();
+        printSuccess("I2C pins set SDA=" + String(PIN_I2C_SDA) + " SCL=" + String(PIN_I2C_SCL));
+        if(mode == I2C_MODE) i2cBegin();
+        return;
+    }
+
+    printError("Unknown i2c config option");
+}
+
+void i2cExecuteMacro(const String& command) {
+    if(command.length() < 2) {
+        printError("Invalid macro syntax");
+        return;
+    }
+
+    String body = command.substring(1, command.length() - 1);
+    auto tokens = parseMacroTokens(body);
+    if(tokens.empty()) {
+        printError("Empty macro");
+        return;
+    }
+
+    uint8_t addr = 0;
+    if(!parseHexByteToken(tokens[0], addr)) {
+        printError("Macro must start with I2C address");
+        return;
+    }
+
+    std::vector<uint8_t> pending;
+    for(size_t i = 1; i < tokens.size(); i++) {
+        String tok = tokens[i];
+        if(tok.startsWith("r:") || tok.startsWith("R:")) {
+            int n = tok.substring(2).toInt();
+            if(n <= 0 || n > 128) {
+                printError("Invalid read length in macro");
+                return;
+            }
+            if(!pending.empty()) {
+                i2cWrite(addr, pending);
+                pending.clear();
+            }
+            std::vector<uint8_t> buf;
+            i2cRequest(addr, n, buf);
+        } else {
+            uint8_t val;
+            if(!parseHexByteToken(tok, val)) {
+                printWarning("Skipping unknown macro token: " + tok);
+                continue;
+            }
+            pending.push_back(val);
+        }
+    }
+
+    if(!pending.empty()) {
+        i2cWrite(addr, pending);
+    }
+}
+
+void i2cEepromShell(uint8_t addr) {
+    printHeader("I2C EEPROM shell @0x" + String(addr, HEX));
+    println("Commands: read <offset> [len], write <offset> <hex..>, fill <offset> <hex> <len>, exit");
+    println("Offsets are 16-bit, values are hex bytes");
+
+    while(true) {
+        String line;
+        if(!readLineBlocking("eeprom> ", line)) {
+            println("Shell cancelled");
+            break;
+        }
+        auto parts = tok(line);
+        if(parts.empty()) continue;
+        String cmd = parts[0];
+        cmd.toLowerCase();
+        if(cmd == "exit" || cmd == "quit") break;
+        if(cmd == "read" && parts.size() >= 2) {
+            uint16_t offset = (uint16_t)strtoul(parts[1].c_str(), nullptr, 0);
+            size_t len = (parts.size() >= 3) ? constrain((int)strtoul(parts[2].c_str(), nullptr, 0), 1, 64) : 16;
+            Wire.beginTransmission(addr);
+            Wire.write((uint8_t)(offset >> 8));
+            Wire.write((uint8_t)(offset & 0xFF));
+            if(Wire.endTransmission(false) != 0) {
+                printError("Failed to set offset");
+                continue;
+            }
+            uint8_t got = Wire.requestFrom((int)addr, (int)len);
+            std::vector<uint8_t> data;
+            while(got-- && Wire.available()) data.push_back(Wire.read());
+            if(data.empty()) {
+                printWarning("No data");
+            } else {
+                printData("  " + toHex(data.data(), data.size()));
+            }
+            continue;
+        }
+        if(cmd == "write" && parts.size() >= 3) {
+            uint16_t offset = (uint16_t)strtoul(parts[1].c_str(), nullptr, 0);
+            auto bytes = parseHexBytes(parts, 2);
+            if(bytes.empty()) {
+                printError("No bytes to write");
+                continue;
+            }
+            Wire.beginTransmission(addr);
+            Wire.write((uint8_t)(offset >> 8));
+            Wire.write((uint8_t)(offset & 0xFF));
+            Wire.write(bytes.data(), bytes.size());
+            uint8_t rc = Wire.endTransmission();
+            if(rc == 0) {
+                printSuccess("Write queued; waiting for EEPROM cycle");
+                delay(10);
+            } else {
+                printError("Write failed rc=" + String(rc));
+            }
+            continue;
+        }
+        if(cmd == "fill" && parts.size() >= 4) {
+            uint16_t offset = (uint16_t)strtoul(parts[1].c_str(), nullptr, 0);
+            uint8_t value;
+            if(!parseHexByteToken(parts[2], value)) {
+                printError("Invalid fill value");
+                continue;
+            }
+            size_t count = constrain((int)strtoul(parts[3].c_str(), nullptr, 0), 1, 64);
+            std::vector<uint8_t> bytes(count, value);
+            Wire.beginTransmission(addr);
+            Wire.write((uint8_t)(offset >> 8));
+            Wire.write((uint8_t)(offset & 0xFF));
+            Wire.write(bytes.data(), bytes.size());
+            uint8_t rc = Wire.endTransmission();
+            if(rc == 0) {
+                printSuccess("Fill queued; waiting");
+                delay(10);
+            } else {
+                printError("Fill failed rc=" + String(rc));
+            }
+            continue;
+        }
+
+        printWarning("Unknown shell command");
+    }
+
+    println("Leaving EEPROM shell");
+}
+
+void i2cSlaveReceive(int len) {
+    String line = "I2C slave RX <- ";
+    std::vector<uint8_t> data;
+    while(len-- > 0 && Wire.available()) {
+        uint8_t b = Wire.read();
+        data.push_back(b);
+    }
+    if(!data.empty()) line += toHex(data.data(), data.size());
+    else line += "(none)";
+    if(i2cSlaveLog.size() > 16) i2cSlaveLog.pop_front();
+    i2cSlaveLog.push_back(line);
+}
+
+void i2cSlaveRequest() {
+    Wire.write(i2cSlaveTxValue);
+    String line = "I2C slave TX -> 0x" + String(i2cSlaveTxValue, HEX);
+    if(i2cSlaveLog.size() > 16) i2cSlaveLog.pop_front();
+    i2cSlaveLog.push_back(line);
+}
+
+void i2cSlaveStart(uint8_t addr, uint32_t durationMs) {
+    if(i2cSlaveMode) {
+        printWarning("I2C slave monitor already active");
+        return;
+    }
+    i2cMonitorStop(true);
+    Wire.end();
+    delay(5);
+    Wire.begin(addr, PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQ);
+    Wire.onReceive(i2cSlaveReceive);
+    Wire.onRequest(i2cSlaveRequest);
+    i2cSlaveMode = true;
+    i2cSlaveAddress = addr;
+    i2cSlaveEnd = durationMs ? millis() + durationMs : 0;
+    i2cSlaveLog.clear();
+    printInfo("I2C slave monitor enabled at 0x" + String(addr, HEX));
+    printInfo("Press ENTER to stop");
+}
+
+void i2cSlaveStop(bool silent) {
+    if(!i2cSlaveMode) return;
+    Wire.onReceive(nullptr);
+    Wire.onRequest(nullptr);
+    Wire.end();
+    delay(5);
+    i2cSlaveMode = false;
+    i2cSlaveLog.clear();
+    if(mode == I2C_MODE) i2cBegin();
+    if(!silent) printWarning("I2C slave monitor disabled");
+}
+
+void serviceI2CSlave() {
+    if(!i2cSlaveMode) return;
+    if(i2cSlaveEnd && millis() > i2cSlaveEnd) {
+        i2cSlaveStop();
+        return;
+    }
+    while(!i2cSlaveLog.empty()) {
+        println(i2cSlaveLog.front());
+        i2cSlaveLog.pop_front();
+    }
+}
+
 // -------- SPI --------
 void spiBegin() {
     SPI.end();
@@ -411,7 +925,7 @@ void spiBegin() {
     SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS);
     pinMode(PIN_SPI_CS, OUTPUT);
     digitalWrite(PIN_SPI_CS, HIGH);
-    println("SPI mode active - " + String(SPI_FREQ/1000) + "kHz");
+    println("SPI mode active - " + String(SPI_FREQ/1000) + "kHz mode " + String(SPI_MODE_CFG) + (SPI_BIT_ORDER == MSBFIRST ? " MSB" : " LSB"));
     displayUpdate();
 }
 
@@ -420,11 +934,11 @@ void spiXfer(const std::vector<uint8_t>& out) {
         println("ERROR: Invalid transfer size (1-256 bytes)");
         return;
     }
-    
+
     std::vector<uint8_t> in(out.size());
     
     digitalWrite(PIN_SPI_CS, LOW);
-    SPI.beginTransaction(SPISettings(SPI_FREQ, MSBFIRST, SPI_MODE0));
+    SPI.beginTransaction(SPISettings(SPI_FREQ, SPI_BIT_ORDER, SPI_MODE_CFG));
     
     for(size_t i = 0; i < out.size(); i++) {
         in[i] = SPI.transfer(out[i]);
@@ -439,12 +953,243 @@ void spiXfer(const std::vector<uint8_t>& out) {
     println("  RX <- " + toHex(in.data(), in.size()));
 }
 
+void spiConfigCmd(const std::vector<String>& v) {
+    if(v.size() < 3) {
+        println("Usage: spi config <option> <value>");
+        println("Options: freq <hz>, mode <0-3>, order msb|lsb, pins <mosi> <miso> <sck> [cs]");
+        return;
+    }
+    String opt = v[2];
+    opt.toLowerCase();
+    if(opt == "freq" && v.size() >= 4) {
+        SPI_FREQ = std::max<uint32_t>(1000, (uint32_t)strtoul(v[3].c_str(), nullptr, 10));
+        printSuccess("SPI frequency set to " + String(SPI_FREQ) + " Hz");
+        if(mode == SPI_MODE) spiBegin();
+        return;
+    }
+    if(opt == "mode" && v.size() >= 4) {
+        int m = constrain(v[3].toInt(), 0, 3);
+        SPI_MODE_CFG = m;
+        printSuccess("SPI mode set to " + String(m));
+        if(mode == SPI_MODE) spiBegin();
+        return;
+    }
+    if(opt == "order" && v.size() >= 4) {
+        String order = v[3];
+        order.toLowerCase();
+        if(order == "msb") SPI_BIT_ORDER = MSBFIRST;
+        else if(order == "lsb") SPI_BIT_ORDER = LSBFIRST;
+        else {
+            printError("Unknown bit order");
+            return;
+        }
+        printSuccess("SPI bit order set to " + order);
+        if(mode == SPI_MODE) spiBegin();
+        return;
+    }
+    if(opt == "pins" && v.size() >= 6) {
+        PIN_SPI_MOSI = v[3].toInt();
+        PIN_SPI_MISO = v[4].toInt();
+        PIN_SPI_SCK = v[5].toInt();
+        if(v.size() >= 7) PIN_SPI_CS = v[6].toInt();
+        printSuccess("SPI pins updated");
+        if(mode == SPI_MODE) spiBegin();
+        return;
+    }
+    printError("Unknown spi config option");
+}
+
+void spiExecuteMacro(const String& command) {
+    if(command.length() < 2) {
+        printError("Invalid SPI macro");
+        return;
+    }
+    auto tokens = parseMacroTokens(command.substring(1, command.length()-1));
+    if(tokens.empty()) {
+        printError("Empty SPI macro");
+        return;
+    }
+    std::vector<uint8_t> txLog;
+    std::vector<uint8_t> rxLog;
+
+    digitalWrite(PIN_SPI_CS, LOW);
+    SPI.beginTransaction(SPISettings(SPI_FREQ, SPI_BIT_ORDER, SPI_MODE_CFG));
+
+    for(const auto& tok : tokens) {
+        if(tok.startsWith("r:") || tok.startsWith("R:")) {
+            int n = tok.substring(2).toInt();
+            if(n <= 0 || n > 256) {
+                printError("Bad SPI read length");
+                continue;
+            }
+            for(int i = 0; i < n; i++) {
+                uint8_t rx = SPI.transfer(0x00);
+                txLog.push_back(0x00);
+                rxLog.push_back(rx);
+            }
+        } else {
+            uint8_t val;
+            if(!parseHexByteToken(tok, val)) {
+                printWarning("Skipping token: " + tok);
+                continue;
+            }
+            uint8_t rx = SPI.transfer(val);
+            txLog.push_back(val);
+            rxLog.push_back(rx);
+        }
+    }
+
+    SPI.endTransaction();
+    digitalWrite(PIN_SPI_CS, HIGH);
+
+    if(!txLog.empty()) {
+        printData("SPI TX -> " + toHex(txLog.data(), txLog.size()));
+        printData("SPI RX <- " + toHex(rxLog.data(), rxLog.size()));
+    }
+}
+
+void spiEepromShell() {
+    printHeader("SPI EEPROM shell (25xx)");
+    println("Commands: read <addr> <len>, write <addr> <hex..>, status, exit");
+    while(true) {
+        String line;
+        if(!readLineBlocking("spi-eeprom> ", line)) break;
+        auto parts = tok(line);
+        if(parts.empty()) continue;
+        String cmd = parts[0];
+        cmd.toLowerCase();
+        if(cmd == "exit" || cmd == "quit") break;
+        if(cmd == "status") {
+            digitalWrite(PIN_SPI_CS, LOW);
+            SPI.beginTransaction(SPISettings(SPI_FREQ, SPI_BIT_ORDER, SPI_MODE_CFG));
+            SPI.transfer(0x05);
+            uint8_t status = SPI.transfer(0x00);
+            SPI.endTransaction();
+            digitalWrite(PIN_SPI_CS, HIGH);
+            printData("Status: 0x" + String(status, HEX));
+            continue;
+        }
+        if(cmd == "read" && parts.size() >= 3) {
+            uint32_t addr = strtoul(parts[1].c_str(), nullptr, 0);
+            size_t len = (parts.size() >= 3) ? constrain((int)strtoul(parts[2].c_str(), nullptr, 0), 1, 128) : 16;
+            digitalWrite(PIN_SPI_CS, LOW);
+            SPI.beginTransaction(SPISettings(SPI_FREQ, SPI_BIT_ORDER, SPI_MODE_CFG));
+            SPI.transfer(0x03);
+            SPI.transfer((addr >> 8) & 0xFF);
+            SPI.transfer(addr & 0xFF);
+            std::vector<uint8_t> data;
+            for(size_t i = 0; i < len; i++) {
+                data.push_back(SPI.transfer(0x00));
+            }
+            SPI.endTransaction();
+            digitalWrite(PIN_SPI_CS, HIGH);
+            printData("  " + toHex(data.data(), data.size()));
+            continue;
+        }
+        if(cmd == "write" && parts.size() >= 3) {
+            uint32_t addr = strtoul(parts[1].c_str(), nullptr, 0);
+            auto bytes = parseHexBytes(parts, 2);
+            if(bytes.empty()) {
+                printError("No data");
+                continue;
+            }
+            // Write enable
+            digitalWrite(PIN_SPI_CS, LOW);
+            SPI.beginTransaction(SPISettings(SPI_FREQ, SPI_BIT_ORDER, SPI_MODE_CFG));
+            SPI.transfer(0x06);
+            SPI.endTransaction();
+            digitalWrite(PIN_SPI_CS, HIGH);
+            delayMicroseconds(10);
+
+            digitalWrite(PIN_SPI_CS, LOW);
+            SPI.beginTransaction(SPISettings(SPI_FREQ, SPI_BIT_ORDER, SPI_MODE_CFG));
+            SPI.transfer(0x02);
+            SPI.transfer((addr >> 8) & 0xFF);
+            SPI.transfer(addr & 0xFF);
+            for(uint8_t b : bytes) SPI.transfer(b);
+            SPI.endTransaction();
+            digitalWrite(PIN_SPI_CS, HIGH);
+            delay(5);
+            printSuccess("Write complete");
+            continue;
+        }
+        printWarning("Unknown EEPROM command");
+    }
+    println("Leaving SPI EEPROM shell");
+}
+
+void spiFlashShell() {
+    printHeader("SPI flash shell");
+    println("Commands: id, read <addr> <len>, status, exit");
+    while(true) {
+        String line;
+        if(!readLineBlocking("spi-flash> ", line)) break;
+        auto parts = tok(line);
+        if(parts.empty()) continue;
+        String cmd = parts[0];
+        cmd.toLowerCase();
+        if(cmd == "exit" || cmd == "quit") break;
+        if(cmd == "id") {
+            digitalWrite(PIN_SPI_CS, LOW);
+            SPI.beginTransaction(SPISettings(SPI_FREQ, SPI_BIT_ORDER, SPI_MODE_CFG));
+            SPI.transfer(0x9F);
+            uint8_t m = SPI.transfer(0x00);
+            uint8_t t = SPI.transfer(0x00);
+            uint8_t c = SPI.transfer(0x00);
+            SPI.endTransaction();
+            digitalWrite(PIN_SPI_CS, HIGH);
+            printData("JEDEC: 0x" + String(m, HEX) + " 0x" + String(t, HEX) + " 0x" + String(c, HEX));
+            continue;
+        }
+        if(cmd == "status") {
+            digitalWrite(PIN_SPI_CS, LOW);
+            SPI.beginTransaction(SPISettings(SPI_FREQ, SPI_BIT_ORDER, SPI_MODE_CFG));
+            SPI.transfer(0x05);
+            uint8_t status = SPI.transfer(0x00);
+            SPI.endTransaction();
+            digitalWrite(PIN_SPI_CS, HIGH);
+            printData("Status: 0x" + String(status, HEX));
+            continue;
+        }
+        if(cmd == "read" && parts.size() >= 3) {
+            uint32_t addr = strtoul(parts[1].c_str(), nullptr, 0);
+            size_t len = constrain((int)strtoul(parts[2].c_str(), nullptr, 0), 1, 256);
+            digitalWrite(PIN_SPI_CS, LOW);
+            SPI.beginTransaction(SPISettings(SPI_FREQ, SPI_BIT_ORDER, SPI_MODE_CFG));
+            SPI.transfer(0x03);
+            SPI.transfer((addr >> 16) & 0xFF);
+            SPI.transfer((addr >> 8) & 0xFF);
+            SPI.transfer(addr & 0xFF);
+            std::vector<uint8_t> data;
+            for(size_t i = 0; i < len; i++) data.push_back(SPI.transfer(0x00));
+            SPI.endTransaction();
+            digitalWrite(PIN_SPI_CS, HIGH);
+            printData("  " + toHex(data.data(), data.size()));
+            continue;
+        }
+        printWarning("Unknown flash command");
+    }
+    println("Leaving SPI flash shell");
+}
+
+void spiSniff() {
+    printWarning("SPI sniffing not supported on this build (requires logic analyzer hardware)");
+}
+
+void spiSlaveMonitor() {
+    printWarning("SPI slave monitor not implemented");
+}
+
+void spiSdcardShell() {
+    printWarning("SD card helper not implemented");
+}
+
 // -------- UART --------
 void uartBegin() {
     TargetUART.end();
     safeYield();
-    
-    TargetUART.begin(UART_BAUD, SERIAL_8N1, PIN_UART_RX, PIN_UART_TX);
+
+    TargetUART.begin(UART_BAUD, UART_CONFIG, PIN_UART_RX, PIN_UART_TX);
     // Note: ESP32 HardwareSerial.begin() returns void, not bool
     
     delay(50);
@@ -464,6 +1209,202 @@ void uartTx(const std::vector<uint8_t>& bytes) {
     size_t written = TargetUART.write(bytes.data(), bytes.size());
     TargetUART.flush();
     println("UART tx -> "+String(written)+"/"+String(bytes.size())+" bytes");
+}
+
+void uartChangeBaud(uint32_t baud) {
+    UART_BAUD = baud;
+    TargetUART.updateBaudRate(baud);
+    println("UART baud=" + String(baud));
+}
+
+void uartScan() {
+    std::vector<uint32_t> bauds = {300, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600};
+    printHeader("UART auto-baud scan");
+    uint32_t original = UART_BAUD;
+    String bestLog = "No activity";
+    for(auto b : bauds) {
+        TargetUART.updateBaudRate(b);
+        flushUartBuffer();
+        unsigned long start = millis();
+        while(millis() - start < 150) {
+            if(TargetUART.available()) {
+                bestLog = "Detected traffic at " + String(b) + " baud";
+                uartChangeBaud(b);
+                TargetUART.write((uint8_t)'?');
+                TargetUART.flush();
+                delay(5);
+                printSuccess(bestLog);
+                goto SCAN_DONE;
+            }
+            delay(5);
+        }
+        printInfo("  " + String(b) + " baud -> silent");
+    }
+SCAN_DONE:
+    if(bestLog == "No activity") {
+        TargetUART.updateBaudRate(original);
+        UART_BAUD = original;
+        printWarning("No UART activity detected");
+    }
+}
+
+void uartPing(const String& probe, uint32_t waitMs) {
+    println("UART ping -> " + probe);
+    TargetUART.write((const uint8_t*)probe.c_str(), probe.length());
+    TargetUART.flush();
+    unsigned long end = millis() + waitMs;
+    String resp;
+    while(millis() < end) {
+        if(TargetUART.available()) {
+            resp += (char)TargetUART.read();
+        }
+        delay(1);
+        safeYield();
+    }
+    if(resp.length()) {
+        printSuccess("UART ping response: " + resp);
+    } else {
+        printWarning("UART ping: no response");
+    }
+}
+
+void uartContinuousRead() {
+    printInfo("UART read mode: press ENTER to stop");
+    while(true) {
+        serviceUARTRx();
+        uint8_t tmp[64];
+        size_t got = uart_popN(tmp, sizeof(tmp));
+        if(got) {
+            USB.write(tmp, got);
+        }
+        if(USB.available()) {
+            char c = USB.read();
+            if(c == '\n' || c == '\r' || c == 0x03) break;
+        }
+        delay(2);
+        safeYield();
+    }
+    println("UART read stopped");
+}
+
+void uartBridge() {
+    if(uartBridgeActive) {
+        printWarning("Bridge already active");
+        return;
+    }
+    uartBridgeActive = true;
+    printInfo("UART bridge running. Press CTRL+] to exit.");
+    while(uartBridgeActive) {
+        serviceUARTRx();
+        uint8_t tmp[128];
+        size_t got = uart_popN(tmp, sizeof(tmp));
+        if(got) {
+            USB.write(tmp, got);
+        }
+        while(USB.available()) {
+            char c = USB.read();
+            if(c == 0x1D) { // CTRL+]
+                uartBridgeActive = false;
+                break;
+            }
+            TargetUART.write((uint8_t)c);
+        }
+        safeYield();
+    }
+    println("UART bridge closed");
+}
+
+void uartSpamStart(const String& text, uint32_t periodMs) {
+    uartSpamPayload = text;
+    uartSpamPeriod = std::max<uint32_t>(periodMs, 10);
+    uartSpamNext = 0;
+    uartSpamActive = true;
+    printInfo("UART spam started every " + String(uartSpamPeriod) + "ms");
+}
+
+void uartAtShell() {
+    printHeader("UART AT helper");
+    println("Type command body (without AT). 'exit' to leave.");
+    while(true) {
+        String line;
+        if(!readLineBlocking("AT> ", line)) break;
+        line.trim();
+        if(line.equalsIgnoreCase("exit") || line.equalsIgnoreCase("quit")) break;
+        String cmd = line.startsWith("AT") ? line : "AT" + line;
+        if(!cmd.endsWith("\r")) cmd += "\r";
+        TargetUART.write((const uint8_t*)cmd.c_str(), cmd.length());
+        TargetUART.flush();
+        unsigned long end = millis() + 500;
+        String response;
+        while(millis() < end) {
+            if(TargetUART.available()) {
+                response += (char)TargetUART.read();
+            }
+        }
+        if(response.length()) println(response);
+    }
+    println("Leaving AT helper");
+}
+
+void uartSendBreak(uint16_t holdMs) {
+    TargetUART.flush();
+    TargetUART.end();
+    pinMode(PIN_UART_TX, OUTPUT);
+    digitalWrite(PIN_UART_TX, LOW);
+    delay(holdMs);
+    digitalWrite(PIN_UART_TX, HIGH);
+    delay(1);
+    uartBegin();
+}
+
+void uartGlitch(uint16_t pulses, uint16_t holdUs) {
+    printWarning("Sending UART glitch pulses");
+    TargetUART.flush();
+    pinMode(PIN_UART_TX, OUTPUT);
+    for(uint16_t i = 0; i < pulses; i++) {
+        digitalWrite(PIN_UART_TX, LOW);
+        delayMicroseconds(holdUs);
+        digitalWrite(PIN_UART_TX, HIGH);
+        delayMicroseconds(holdUs);
+    }
+    uartBegin();
+}
+
+void uartConfigCmd(const std::vector<String>& v) {
+    if(v.size() < 3) {
+        println("Usage: uart config <option> <value>");
+        println("Options: baud <rate>, format <7E1|8N1|...>, pins <rx> <tx>");
+        return;
+    }
+    String opt = v[2];
+    opt.toLowerCase();
+    if(opt == "baud" && v.size() >= 4) {
+        uint32_t baud = std::max<uint32_t>(300, (uint32_t)strtoul(v[3].c_str(), nullptr, 10));
+        uartChangeBaud(baud);
+        return;
+    }
+    if(opt == "format" && v.size() >= 4) {
+        String fmt = v[3];
+        fmt.toUpperCase();
+        if(fmt == "8N1") UART_CONFIG = SERIAL_8N1;
+        else if(fmt == "8E1") UART_CONFIG = SERIAL_8E1;
+        else if(fmt == "8O1") UART_CONFIG = SERIAL_8O1;
+        else if(fmt == "7E1") UART_CONFIG = SERIAL_7E1;
+        else if(fmt == "7O1") UART_CONFIG = SERIAL_7O1;
+        else {
+            printError("Unsupported format");
+            return;
+        }
+        uartBegin();
+        return;
+    }
+    if(opt == "pins" && v.size() >= 5) {
+        PIN_UART_RX = v[3].toInt();
+        PIN_UART_TX = v[4].toInt();
+        uartBegin();
+        return;
+    }
+    printError("Unknown UART config option");
 }
 
 // -------- UART RX buffer - FIXED --------
@@ -493,11 +1434,71 @@ size_t uart_popN(uint8_t* out, size_t maxN) {
     return n;
 }
 
+void flushUartBuffer() {
+    uart_head = uart_tail = 0;
+    while(TargetUART.available()) TargetUART.read();
+}
+
 void serviceUARTRx() {
     int count = 0;
     while(TargetUART.available() && count < 64) { // Limit reads per call
         uart_push((uint8_t)TargetUART.read());
         count++;
+    }
+}
+
+void stopUartSpam() {
+    if(uartSpamActive) {
+        uartSpamActive = false;
+        printWarning("UART spam stopped");
+    }
+}
+
+void serviceUartSpam() {
+    if(!uartSpamActive) return;
+    unsigned long now = millis();
+    if(now < uartSpamNext) return;
+    uartSpamNext = now + uartSpamPeriod;
+    TargetUART.write((const uint8_t*)uartSpamPayload.c_str(), uartSpamPayload.length());
+    TargetUART.flush();
+}
+
+void uartExecuteMacro(const String& command) {
+    if(command.length() < 2) return;
+    String body = command.substring(1, command.length() - 1);
+    auto tokens = parseMacroTokens(body);
+    if(tokens.empty()) return;
+    for(const auto& tok : tokens) {
+        if(tok.startsWith("r:") || tok.startsWith("R:")) {
+            int want = tok.substring(2).toInt();
+            if(want <= 0 || want > 256) {
+                printError("Invalid UART read length");
+                return;
+            }
+            unsigned long end = millis() + 500;
+            std::vector<uint8_t> buf;
+            while(buf.size() < (size_t)want && millis() < end) {
+                serviceUARTRx();
+                while(uart_avail() && buf.size() < (size_t)want) {
+                    buf.push_back(uart_buf[uart_tail]);
+                    uart_tail = (uart_tail + 1) % UART_BUF_SZ;
+                }
+            }
+            if(buf.empty()) printWarning("UART macro read timeout");
+            else printData("UART <- " + toHex(buf.data(), buf.size()));
+        } else if(tok.length() >= 2 && (tok[0] == '\'' || tok[0] == '"')) {
+            String text = tok.substring(1, tok.length() - 1);
+            TargetUART.write((const uint8_t*)text.c_str(), text.length());
+            TargetUART.flush();
+        } else {
+            uint8_t val;
+            if(!parseHexByteToken(tok, val)) {
+                printWarning("Skipping token: " + tok);
+                continue;
+            }
+            TargetUART.write(val);
+            TargetUART.flush();
+        }
     }
 }
 
@@ -559,9 +1560,87 @@ std::vector<uint8_t> parseHexBytes(const std::vector<String>& v, size_t start) {
     return out;
 }
 
+bool parseHexByteToken(const String& token, uint8_t& value) {
+    String t = token;
+    t.replace("0x","");
+    t.replace("0X","");
+    if(t.length() == 0 || t.length() > 2) return false;
+    while(t.length() < 2) t = "0" + t;
+    if(!isHex(t[0]) || !isHex(t[1])) return false;
+    value = (uint8_t)strtoul(t.c_str(), nullptr, 16);
+    return true;
+}
+
+std::vector<String> parseMacroTokens(const String& raw) {
+    std::vector<String> tokens;
+    String current;
+    bool inString = false;
+    char stringQuote = '\0';
+
+    for(size_t i = 0; i < raw.length() && i < 512; i++) {
+        char c = raw[i];
+        if(inString) {
+            current += c;
+            if(c == stringQuote) {
+                tokens.push_back(current);
+                current = "";
+                inString = false;
+                stringQuote = '\0';
+            }
+            continue;
+        }
+
+        if(c == '\'' || c == '"') {
+            if(current.length()) {
+                tokens.push_back(current);
+                current = "";
+            }
+            current += c;
+            inString = true;
+            stringQuote = c;
+            continue;
+        }
+
+        if(c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            if(current.length()) {
+                tokens.push_back(current);
+                current = "";
+            }
+        } else {
+            current += c;
+        }
+    }
+
+    if(current.length()) tokens.push_back(current);
+    return tokens;
+}
+
+bool readLineBlocking(String promptText, String& out, unsigned long timeoutMs) {
+    out = "";
+    if(promptText.length()) {
+        print(promptText);
+    }
+    unsigned long start = millis();
+    while(true) {
+        while(USB.available()) {
+            char c = USB.read();
+            if(c == '\r') continue;
+            if(c == '\n') {
+                print("\n");
+                return true;
+            }
+            out += c;
+        }
+        if(timeoutMs && millis() - start > timeoutMs) return false;
+        if(i2cSlaveMode) serviceI2CSlave();
+        if(mode == UART_MODE) serviceUARTRx();
+        safeYield();
+    }
+}
+
 void help() {
     showStatusBarLine();
-    printHeader("=== ESP32 Bus Pirate Commands ===");
+    printHeader("=== WireTap-32 Commands ===");
     println("");
     println("GENERAL:");
     println("  help, h, ?        - Show this help");
@@ -571,6 +1650,8 @@ void help() {
     println("  colors [on|off]   - Toggle/set color output");
     println("  statusbar [on|off] - Toggle/set status bar");
     println("  display [on|off]  - Toggle/set OLED display");
+    println("  pullups on|off    - Toggle I2C pull-ups");
+    println("  freq i2c|spi <hz> - Quick frequency change");
     println("  <Enter>           - Repeat last command");
     println("");
     println("MODES:");
@@ -578,20 +1659,28 @@ void help() {
     println("  Examples: 'm i' = I2C mode, 'm h' = Hi-Z safe mode");
     println("");
     println("I2C COMMANDS: (requires 'mode i2c' first)");
-    println("  i2c scan, i2c s   - Scan for devices (0x01-0x7F) with progress");
-    println("  i2c r [addr] [len] - Read bytes (uses last addr/len if omitted)");
-    println("  i2c w <addr> <hex...> - Write bytes: 'i2c w 0x50 0x00 0xFF'");
-    println("  pullups on|off    - Enable/disable I2C pullups");
-    println("  freq i2c <hz>     - Set frequency (10000-400000Hz)");
+    println("  i2c scan          - Scan for devices");
+    println("  i2c ping <addr>   - Probe address for ACK");
+    println("  i2c identify <addr> - Guess device based on common addresses");
+    println("  i2c read <addr> <reg> [len]  - Read register");
+    println("  i2c write <addr> <reg> <hex...> - Write register");
+    println("  i2c dump <addr> [len]        - Dump sequential bytes");
+    println("  i2c slave <addr> [ms]        - Emulate slave/logger");
+    println("  i2c flood/glitch/monitor/eeprom/recover/config");
+    println("  [0x13 0x4B r:8]    - Macro syntax for advanced sequences");
     println("");
     println("SPI COMMANDS: (requires 'mode spi' first)");
     println("  spi x <hex...>    - Transfer bytes: 'spi x 0x90 0x00'");
-    println("  freq spi <hz>     - Set frequency (1000-10000000Hz)");
+    println("  spi sniff|slave|sdcard|eeprom|flash - Mode helpers");
+    println("  spi config freq|mode|order|pins ...");
+    println("  [0x9F r:3]        - SPI macro (JEDEC ID example)");
     println("");
     println("UART COMMANDS: (requires 'mode uart' first)");
-    println("  uart baud <rate>  - Set baud rate: 'uart baud 9600'");
-    println("  uart tx <data>    - Send: 'uart tx \"Hello\"' or 'uart tx 0x41 0x42'");
-    println("  uart rx <len>     - Read bytes: 'uart rx 10'");
+    println("  uart baud|scan|ping|read|write|bridge|spam|at");
+    println("  uart tx <data>    - Send: 'uart tx \"Hello\"' or hex bytes");
+    println("  uart rx <len>     - Read bytes once");
+    println("  uart config baud|format|pins ...");
+    println("  ['Hello' r:64]    - UART macro syntax");
     println("");
     println("GPIO COMMANDS: (requires 'mode gpio' first)");
     println("  gpio set <pin> <val> - Set output: 'gpio set 2 1' (HIGH)");
@@ -630,6 +1719,21 @@ void handleCmd(const String& line) {
     
     String c=v[0];
     c.toLowerCase();
+
+    String trimmed = line;
+    trimmed.trim();
+    if(trimmed.startsWith("[") && trimmed.endsWith("]")) {
+        if(mode == I2C_MODE) {
+            i2cExecuteMacro(trimmed);
+        } else if(mode == SPI_MODE) {
+            spiExecuteMacro(trimmed);
+        } else if(mode == UART_MODE) {
+            uartExecuteMacro(trimmed);
+        } else {
+            printError("Macros require protocol mode");
+        }
+        return;
+    }
 
     if(c=="help"||c=="?"||c=="h") { help(); return; }
     if(c=="status"||c=="stat"||c=="s") { showStatus(); return; }
@@ -769,49 +1873,126 @@ void handleCmd(const String& line) {
         String cmd = v[1];
         cmd.toLowerCase();
         if(cmd=="scan"||cmd=="s") { i2cScan(); return; }
+        if(cmd=="ping" && v.size()>=3) {
+            uint8_t addr = (uint8_t)strtoul(v[2].c_str(), nullptr, 0);
+            i2cPing(addr);
+            return;
+        }
+        if(cmd=="identify" && v.size()>=3) {
+            uint8_t addr = (uint8_t)strtoul(v[2].c_str(), nullptr, 0);
+            i2cIdentify(addr);
+            return;
+        }
+        if(cmd=="sniff") {
+            printWarning("Passive I2C sniffing not supported on this hardware");
+            return;
+        }
         if(cmd=="read"||cmd=="r") {
-            uint8_t addr = lastI2CAddr;  // Use last address as default
-            int len = lastReadLen;       // Use last length as default
-
-            if(v.size()>=3) addr = (uint8_t) strtoul(v[2].c_str(), nullptr, 0);
-            if(v.size()>=4) len = constrain(v[3].toInt(), 1, 128);
-
-            // Update defaults for next time
-            lastI2CAddr = addr;
-            lastReadLen = len;
-
-            if(v.size()<3) printInfo("Using last address: 0x" + String(addr, HEX));
-            if(v.size()<4) printInfo("Using last length: " + String(len));
-
-            i2cRead(addr, len);
+            if(v.size()<4) {
+                printError("Usage: i2c read <addr> <reg> [len]");
+                return;
+            }
+            uint8_t addr = (uint8_t)strtoul(v[2].c_str(), nullptr, 0);
+            uint8_t reg = (uint8_t)strtoul(v[3].c_str(), nullptr, 0);
+            size_t len = (v.size()>=5) ? constrain(v[4].toInt(), 1, 128) : 1;
+            std::vector<uint8_t> buf;
+            i2cReadRegister(addr, reg, len, buf);
             return;
         }
         if((cmd=="write"||cmd=="w") && v.size()>=3) {
-            uint8_t addr = lastI2CAddr;  // Use last address as default
-
-            if(v.size()>=3) addr = (uint8_t) strtoul(v[2].c_str(), nullptr, 0);
-            if(v.size()<4) {
-                printError("ERROR: No data to write. Usage: i2c w <addr> <hex...>");
+            if(v.size()<5) {
+                printError("Usage: i2c write <addr> <reg> <hex...>");
                 return;
             }
-
-            lastI2CAddr = addr;  // Update default
-
-            auto bytes = parseHexBytes(v, 3);
-            i2cWrite(addr, bytes);
+            uint8_t addr = (uint8_t)strtoul(v[2].c_str(), nullptr, 0);
+            uint8_t reg = (uint8_t)strtoul(v[3].c_str(), nullptr, 0);
+            auto bytes = parseHexBytes(v, 4);
+            if(bytes.empty()) {
+                printError("No bytes provided");
+                return;
+            }
+            i2cWriteRegister(addr, reg, bytes);
+            return;
+        }
+        if(cmd=="dump" && v.size()>=3) {
+            uint8_t addr = (uint8_t)strtoul(v[2].c_str(), nullptr, 0);
+            size_t len = (v.size()>=4) ? constrain(v[3].toInt(), 1, 512) : 256;
+            i2cDump(addr, len);
+            return;
+        }
+        if(cmd=="slave" && v.size()>=3) {
+            if(v[2]=="stop") {
+                i2cSlaveStop();
+                return;
+            }
+            uint8_t addr = (uint8_t)strtoul(v[2].c_str(), nullptr, 0);
+            uint32_t duration = (v.size()>=4) ? (uint32_t)strtoul(v[3].c_str(), nullptr, 0) : 0;
+            i2cSlaveStart(addr, duration);
+            return;
+        }
+        if(cmd=="flood" && v.size()>=3) {
+            uint8_t addr = (uint8_t)strtoul(v[2].c_str(), nullptr, 0);
+            size_t count = (v.size()>=4) ? (size_t)std::max<long>(1, v[3].toInt()) : 32;
+            i2cFlood(addr, count);
+            return;
+        }
+        if(cmd=="glitch" && v.size()>=3) {
+            uint8_t addr = (uint8_t)strtoul(v[2].c_str(), nullptr, 0);
+            size_t pulses = (v.size()>=4) ? (size_t)std::max<long>(1, v[3].toInt()) : 8;
+            i2cInjectGlitches(addr, pulses);
+            return;
+        }
+        if(cmd=="monitor") {
+            if(v.size()==3 && v[2]=="stop") {
+                i2cMonitorStop();
+                return;
+            }
+            if(v.size()>=3) {
+                uint8_t addr = (uint8_t)strtoul(v[2].c_str(), nullptr, 0);
+                uint8_t reg = (v.size()>=4) ? (uint8_t)strtoul(v[3].c_str(), nullptr, 0) : 0;
+                size_t len = (v.size()>=5) ? (size_t)std::max<long>(1, v[4].toInt()) : 1;
+                uint32_t ms = (v.size()>=6) ? (uint32_t)strtoul(v[5].c_str(), nullptr, 0) : 500;
+                i2cMonitorStart(addr, reg, len, ms);
+            } else {
+                i2cMonitorStop();
+            }
+            return;
+        }
+        if(cmd=="eeprom" && v.size()>=3) {
+            uint8_t addr = (uint8_t)strtoul(v[2].c_str(), nullptr, 0);
+            i2cEepromShell(addr);
+            return;
+        }
+        if(cmd=="recover") {
+            i2cRecoverBus();
+            return;
+        }
+        if(cmd=="config") {
+            i2cConfigCmd(v);
             return;
         }
     }
 
-    if(c=="spi" && v.size()>=2 && (v[1]=="x"||v[1]=="xfer")) {
-        if(mode != SPI_MODE) {
+    if(c=="spi" && v.size()>=2) {
+        String cmd = v[1];
+        cmd.toLowerCase();
+        bool needsMode = (cmd != "config");
+        if(needsMode && mode != SPI_MODE) {
             println("ERROR: Not in SPI mode (currently in " + String(mode == HIZ ? "HiZ" : mode == GPIO_MODE ? "GPIO" : mode == I2C_MODE ? "I2C" : "UART") + ")");
             println("Use 'mode spi' or 'm s' to switch to SPI mode first.");
             return;
         }
-        auto bytes = parseHexBytes(v, 2);
-        spiXfer(bytes);
-        return;
+        if(cmd=="x"||cmd=="xfer") {
+            auto bytes = parseHexBytes(v, 2);
+            spiXfer(bytes);
+            return;
+        }
+        if(cmd=="sniff") { spiSniff(); return; }
+        if(cmd=="slave") { spiSlaveMonitor(); return; }
+        if(cmd=="sdcard") { spiSdcardShell(); return; }
+        if(cmd=="eeprom") { spiEepromShell(); return; }
+        if(cmd=="flash") { spiFlashShell(); return; }
+        if(cmd=="config") { spiConfigCmd(v); return; }
     }
 
     if(c=="uart" && v.size()>=2) {
@@ -821,6 +2002,31 @@ void handleCmd(const String& line) {
             UART_BAUD = constrain((uint32_t)strtoul(v[2].c_str(), nullptr, 10), 1200, 2000000);
             if(mode == UART_MODE) uartBegin();
             println("UART baud="+String(UART_BAUD));
+            return;
+        }
+        if(cmd=="scan") {
+            if(mode != UART_MODE) {
+                println("ERROR: Not in UART mode. Use 'mode uart' first.");
+                return;
+            }
+            uartScan();
+            return;
+        }
+        if(cmd=="ping") {
+            if(mode != UART_MODE) {
+                println("ERROR: Not in UART mode. Use 'mode uart' first.");
+                return;
+            }
+            String probe = (v.size() >= 3) ? line.substring(line.indexOf(v[2])) : String("PING\r\n");
+            uartPing(probe, 200);
+            return;
+        }
+        if(cmd=="read") {
+            if(mode != UART_MODE) {
+                println("ERROR: Not in UART mode. Use 'mode uart' first.");
+                return;
+            }
+            uartContinuousRead();
             return;
         }
         if(cmd=="tx" && v.size()>=3) {
@@ -836,6 +2042,28 @@ void handleCmd(const String& line) {
                 for(size_t i=0; i<s.length() && i<1024; i++) {
                     bytes.push_back((uint8_t)s[i]);
                 }
+            } else {
+                bytes = parseHexBytes(v, 2);
+            }
+            uartTx(bytes);
+            return;
+        }
+        if(cmd=="write" && v.size()>=3) {
+            if(mode != UART_MODE) {
+                println("ERROR: Not in UART mode. Use 'mode uart' first.");
+                return;
+            }
+            std::vector<uint8_t> bytes;
+            if(v[2].startsWith("\"") && line.lastIndexOf('"')>2) {
+                int a=line.indexOf('"');
+                int b=line.lastIndexOf('"');
+                String s=line.substring(a+1,b);
+                for(size_t i=0; i<s.length() && i<1024; i++) bytes.push_back((uint8_t)s[i]);
+            } else if(v[2].startsWith("'" ) && line.lastIndexOf('\'')>2) {
+                int a=line.indexOf('\'');
+                int b=line.lastIndexOf('\'');
+                String s=line.substring(a+1,b);
+                for(size_t i=0; i<s.length() && i<1024; i++) bytes.push_back((uint8_t)s[i]);
             } else {
                 bytes = parseHexBytes(v, 2);
             }
@@ -861,6 +2089,63 @@ void handleCmd(const String& line) {
                 safeYield();
             }
             println(got ? ("UART rx <- "+toHex(tmp.data(), got)) : "UART rx: (timeout)");
+            return;
+        }
+        if(cmd=="bridge") {
+            if(mode != UART_MODE) {
+                println("ERROR: Not in UART mode. Use 'mode uart' first.");
+                return;
+            }
+            uartBridge();
+            return;
+        }
+        if(cmd=="spam" && v.size()>=3 && v[2]=="stop") {
+            stopUartSpam();
+            return;
+        }
+        if(cmd=="spam" && v.size()>=4) {
+            if(mode != UART_MODE) {
+                println("ERROR: Not in UART mode. Use 'mode uart' first.");
+                return;
+            }
+            int start = line.indexOf(v[2]);
+            int periodPos = line.lastIndexOf(v.back());
+            String message = line.substring(start, periodPos);
+            message.trim();
+            uint32_t period = std::max<uint32_t>(10, (uint32_t)strtoul(v.back().c_str(), nullptr, 10));
+            if(message.startsWith("\"") && message.endsWith("\"")) {
+                message = message.substring(1, message.length()-1);
+            }
+            if(message.startsWith("'") && message.endsWith("'")) {
+                message = message.substring(1, message.length()-1);
+            }
+            uartSpamStart(message, period);
+            return;
+        }
+        if(cmd=="at") {
+            if(mode != UART_MODE) {
+                println("ERROR: Not in UART mode. Use 'mode uart' first.");
+                return;
+            }
+            uartAtShell();
+            return;
+        }
+        if(cmd=="glitch") {
+            if(mode != UART_MODE) {
+                println("ERROR: Not in UART mode. Use 'mode uart' first.");
+                return;
+            }
+            uint16_t pulses = (v.size()>=3) ? (uint16_t)strtoul(v[2].c_str(), nullptr, 0) : 8;
+            uint16_t hold = (v.size()>=4) ? (uint16_t)strtoul(v[3].c_str(), nullptr, 0) : 1;
+            uartGlitch(pulses, hold);
+            return;
+        }
+        if(cmd=="xmodem") {
+            printWarning("XMODEM transfer not implemented in this build");
+            return;
+        }
+        if(cmd=="config") {
+            uartConfigCmd(v);
             return;
         }
     }
@@ -955,6 +2240,9 @@ void loop() {
     // Service UART if in UART mode
     if (mode == UART_MODE) {
         serviceUARTRx();
+        serviceUartSpam();
+    } else {
+        if(uartSpamActive) stopUartSpam();
     }
     
     // Handle serial input
@@ -962,6 +2250,11 @@ void loop() {
 
     // Update display
     displayUpdate();
+
+    if(mode == I2C_MODE) {
+        serviceI2CMonitor();
+    }
+    serviceI2CSlave();
 
     // Periodic maintenance
     checkHeap();
