@@ -1,7 +1,11 @@
-// ESP32_MicroBusPirate_Web_UART.ino - STABLE VERSION
+// ESP32_MicroBusPirate_Web_UART.ino - BLUETOOTH EXPERIMENTAL VERSION
 // Fixed watchdog and stability issues
 // Single-file "mini Bus Pirate" with web console AND live UART terminal
+// Now includes Bluetooth functionality for device scanning, pairing, and HID operations
 // No external libs beyond Arduino core. Works on ESP32 Dev Module.
+
+// -------- Bluetooth Feature Flag --------
+#define ENABLE_BLUETOOTH 1  // Set to 0 to disable Bluetooth and save memory
 
 // WiFi and WebServer includes removed for serial-only version
 #include <Wire.h>
@@ -12,6 +16,21 @@
 #include <esp_system.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+
+// -------- Bluetooth Includes --------
+#if ENABLE_BLUETOOTH
+#include "BluetoothSerial.h"
+#include "NimBLEDevice.h"
+#include "NimBLEServer.h"
+#include "NimBLEHIDDevice.h"
+#include "NimBLECharacteristic.h"
+#include "NimBLEAdvertising.h"
+#include "NimBLEScan.h"
+#include "NimBLEAddress.h"
+#include "esp_bt.h"
+#include "esp_bt_main.h"
+#include "esp_gap_bt_api.h"
+#endif
 
 // WiFi AP variables removed for serial-only version
 
@@ -60,7 +79,7 @@ String flushCapture() {
     return outbuf;
 }
 
-enum Mode {HIZ, GPIO_MODE, I2C_MODE, SPI_MODE, UART_MODE};
+enum Mode {HIZ, GPIO_MODE, I2C_MODE, SPI_MODE, UART_MODE, BLUETOOTH_MODE};
 Mode mode = HIZ;
 
 // -------- Default pins --------
@@ -95,6 +114,94 @@ unsigned long i2cSlaveEnd = 0;
 uint8_t i2cSlaveAddress = 0x00;
 uint8_t i2cSlaveTxValue = 0x00;
 
+#if ENABLE_BLUETOOTH
+// -------- Bluetooth state variables --------
+BluetoothSerial SerialBT;
+NimBLEServer* pServer = nullptr;
+NimBLEHIDDevice* pHID = nullptr;
+NimBLECharacteristic* pInputChar = nullptr;
+NimBLECharacteristic* pOutputChar = nullptr;
+NimBLEScan* pBLEScan = nullptr;
+bool bluetoothInitialized = false;
+bool bleServerStarted = false;
+bool btSniffing = false;
+bool btKeyboardBridge = false;
+bool btMouseJiggle = false;
+unsigned long btMouseJiggleNext = 0;
+uint32_t btMouseJiggleInterval = 1000;
+String btDeviceName = "Bus-Pirate-Bluetooth";
+String btSpoofedMAC = "";
+std::vector<String> btScanResults;
+std::deque<String> btSniffLog;
+
+// HID Report Maps
+static const uint8_t hidReportMapKeyboard[] = {
+    0x05, 0x01,  // Usage Page (Generic Desktop)
+    0x09, 0x06,  // Usage (Keyboard)
+    0xA1, 0x01,  // Collection (Application)
+    0x85, 0x01,  // Report ID (1)
+    0x05, 0x07,  // Usage Page (Key Codes)
+    0x19, 0xE0,  // Usage Minimum (224)
+    0x29, 0xE7,  // Usage Maximum (231)
+    0x15, 0x00,  // Logical Minimum (0)
+    0x25, 0x01,  // Logical Maximum (1)
+    0x75, 0x01,  // Report Size (1)
+    0x95, 0x08,  // Report Count (8)
+    0x81, 0x02,  // Input (Data, Variable, Absolute)
+    0x95, 0x01,  // Report Count (1)
+    0x75, 0x08,  // Report Size (8)
+    0x81, 0x01,  // Input (Constant) reserved byte(1)
+    0x95, 0x05,  // Report Count (5)
+    0x75, 0x01,  // Report Size (1)
+    0x05, 0x08,  // Usage Page (Page# for LEDs)
+    0x19, 0x01,  // Usage Minimum (1)
+    0x29, 0x05,  // Usage Maximum (5)
+    0x91, 0x02,  // Output (Data, Variable, Absolute), Led report
+    0x95, 0x01,  // Report Count (1)
+    0x75, 0x03,  // Report Size (3)
+    0x91, 0x01,  // Output (Data, Variable, Absolute), Led report padding
+    0x95, 0x06,  // Report Count (6)
+    0x75, 0x08,  // Report Size (8)
+    0x15, 0x00,  // Logical Minimum (0)
+    0x25, 0x65,  // Logical Maximum (101)
+    0x05, 0x07,  // Usage Page (Key codes)
+    0x19, 0x00,  // Usage Minimum (0)
+    0x29, 0x65,  // Usage Maximum (101)
+    0x81, 0x00,  // Input (Data, Array) Key array(6 bytes)
+    0xC0         // End Collection (Application)
+};
+
+static const uint8_t hidReportMapMouse[] = {
+    0x05, 0x01,  // Usage Page (Generic Desktop)
+    0x09, 0x02,  // Usage (Mouse)
+    0xA1, 0x01,  // Collection (Application)
+    0x85, 0x02,  // Report ID (2)
+    0x09, 0x01,  // Usage (Pointer)
+    0xA1, 0x00,  // Collection (Physical)
+    0x05, 0x09,  // Usage Page (Buttons)
+    0x19, 0x01,  // Usage Minimum (1)
+    0x29, 0x03,  // Usage Maximum (3)
+    0x15, 0x00,  // Logical Minimum (0)
+    0x25, 0x01,  // Logical Maximum (1)
+    0x95, 0x03,  // Report Count (3)
+    0x75, 0x01,  // Report Size (1)
+    0x81, 0x02,  // Input (Data, Variable, Absolute)
+    0x95, 0x01,  // Report Count (1)
+    0x75, 0x05,  // Report Size (5)
+    0x81, 0x01,  // Input (Constant), padding
+    0x05, 0x01,  // Usage Page (Generic Desktop)
+    0x09, 0x30,  // Usage (X)
+    0x09, 0x31,  // Usage (Y)
+    0x15, 0x81,  // Logical Minimum (-127)
+    0x25, 0x7F,  // Logical Maximum (127)
+    0x75, 0x08,  // Report Size (8)
+    0x95, 0x02,  // Report Count (2)
+    0x81, 0x06,  // Input (Data, Variable, Relative)
+    0xC0,        // End Collection (Physical)
+    0xC0         // End Collection (Application)
+};
+#endif
+
 // Forward declarations
 void serviceUARTRx();
 void serviceI2CSlave();
@@ -105,6 +212,27 @@ bool readLineBlocking(String promptText, String& out, unsigned long timeoutMs = 
 std::vector<String> tok(const String& s);
 std::vector<uint8_t> parseHexBytes(const std::vector<String>& v, size_t start);
 bool parseHexByteToken(const String& token, uint8_t& value);
+
+#if ENABLE_BLUETOOTH
+// Bluetooth forward declarations
+void btBegin();
+void btEnd();
+void btScan(int seconds = 10);
+void btPair(const String& mac);
+void btSpoof(const String& mac);
+void btSniff();
+void btSniffStop();
+void btServer(const String& name = "");
+void btKeyboard();
+void btKeyboardSend(const String& text);
+void btMouseMove(int x, int y);
+void btMouseClick();
+void btMouseJiggleStart(uint32_t intervalMs = 1000);
+void btMouseJiggleStop();
+void btStatus();
+void btReset();
+void serviceBluetooth();
+#endif
 
 // -------- UART target --------
 HardwareSerial TargetUART(2);
@@ -188,7 +316,7 @@ void printHeader(const String& s) {
 void showStatusBarLine() {
     if(!showStatusBar) return;
 
-    String modeStr = (mode == HIZ ? "HiZ" : mode == GPIO_MODE ? "GPIO" : mode == I2C_MODE ? "I2C" : mode == SPI_MODE ? "SPI" : "UART");
+    String modeStr = (mode == HIZ ? "HiZ" : mode == GPIO_MODE ? "GPIO" : mode == I2C_MODE ? "I2C" : mode == SPI_MODE ? "SPI" : mode == UART_MODE ? "UART" : "BT");
     String heapStr = String(ESP.getFreeHeap()/1024) + "KB";
     String uptimeStr = String(millis()/1000) + "s";
 
@@ -273,7 +401,8 @@ void displayUpdate() {
 
     // Mode
     String modeStr = (mode == HIZ ? "HiZ" : mode == GPIO_MODE ? "GPIO" :
-                     mode == I2C_MODE ? "I2C" : mode == SPI_MODE ? "SPI" : "UART");
+                     mode == I2C_MODE ? "I2C" : mode == SPI_MODE ? "SPI" :
+                     mode == UART_MODE ? "UART" : "BT");
     display.print("Mode: ");
     display.println(modeStr);
 
@@ -1502,6 +1631,452 @@ void uartExecuteMacro(const String& command) {
     }
 }
 
+#if ENABLE_BLUETOOTH
+// -------- Bluetooth Functions --------
+
+void btBegin() {
+    if(bluetoothInitialized) {
+        printWarning("Bluetooth already initialized");
+        return;
+    }
+
+    printInfo("Initializing Bluetooth...");
+    uint32_t heapBefore = ESP.getFreeHeap();
+
+    // Initialize NimBLE
+    NimBLEDevice::init(btDeviceName);
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+    // Set spoofed MAC if configured
+    if(btSpoofedMAC.length() > 0) {
+        NimBLEAddress addr(btSpoofedMAC);
+        NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+        NimBLEDevice::setCustomAddress(addr);
+        printInfo("Using spoofed MAC: " + btSpoofedMAC);
+    }
+
+    bluetoothInitialized = true;
+    uint32_t heapAfter = ESP.getFreeHeap();
+
+    printSuccess("Bluetooth initialized");
+    printInfo("Memory used: " + String((heapBefore - heapAfter)/1024) + "KB, Free: " + String(heapAfter/1024) + "KB");
+
+    if(heapAfter < 80000) {
+        printWarning("Low memory! Consider disabling other modes for stable BT operation");
+    }
+}
+
+void btEnd() {
+    if(!bluetoothInitialized) {
+        printWarning("Bluetooth not initialized");
+        return;
+    }
+
+    printInfo("Stopping Bluetooth...");
+
+    // Stop all BT activities
+    btSniffStop();
+    btMouseJiggleStop();
+    btKeyboardBridge = false;
+
+    if(bleServerStarted) {
+        if(pServer) {
+            pServer->getAdvertising()->stop();
+            pServer = nullptr;
+        }
+        bleServerStarted = false;
+    }
+
+    if(pBLEScan) {
+        pBLEScan->stop();
+        pBLEScan = nullptr;
+    }
+
+    NimBLEDevice::deinit(true);
+    bluetoothInitialized = false;
+
+    printSuccess("Bluetooth stopped");
+    printInfo("Free heap: " + String(ESP.getFreeHeap()/1024) + "KB");
+}
+
+void btScan(int seconds) {
+    if(!bluetoothInitialized) {
+        btBegin();
+    }
+
+    printHeader("Bluetooth Device Scan (" + String(seconds) + "s)");
+    btScanResults.clear();
+
+    pBLEScan = NimBLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new class : public NimBLEAdvertisedDeviceCallbacks {
+        void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+            String result = "";
+            result += advertisedDevice->getAddress().toString().c_str();
+            result += " RSSI:" + String(advertisedDevice->getRSSI());
+            result += " Name:'" + String(advertisedDevice->getName().c_str()) + "'";
+
+            if(advertisedDevice->haveManufacturerData()) {
+                std::string mfgData = advertisedDevice->getManufacturerData();
+                result += " Mfg:[" + toHex((uint8_t*)mfgData.data(), std::min<size_t>(mfgData.size(), 8)) + "]";
+            }
+
+            println(result);
+            btScanResults.push_back(result);
+            safeYield();
+        }
+    });
+
+    pBLEScan->setActiveScan(true);
+    pBLEScan->setInterval(100);
+    pBLEScan->setWindow(99);
+
+    NimBLEScanResults foundDevices = pBLEScan->start(seconds, false);
+
+    printInfo("Scan complete. Found " + String(foundDevices.getCount()) + " devices");
+    pBLEScan->clearResults();
+}
+
+void btPair(const String& mac) {
+    if(!bluetoothInitialized) {
+        btBegin();
+    }
+
+    printInfo("Attempting to pair with " + mac);
+
+    // Note: NimBLE pairing is complex and requires security callbacks
+    // For now, we'll implement basic connection attempt
+    NimBLEAddress addr(mac);
+    NimBLEClient* pClient = NimBLEDevice::createClient();
+
+    if(pClient->connect(addr)) {
+        printSuccess("Connected to " + mac);
+
+        // Discover services
+        std::vector<NimBLERemoteService*>* services = pClient->getServices(true);
+        if(services->size() > 0) {
+            printInfo("Services discovered:");
+            for(auto service : *services) {
+                println("  " + String(service->getUUID().toString().c_str()));
+            }
+        }
+
+        pClient->disconnect();
+        printInfo("Disconnected");
+    } else {
+        printError("Failed to connect to " + mac);
+    }
+
+    NimBLEDevice::deleteClient(pClient);
+}
+
+void btSpoof(const String& mac) {
+    if(bluetoothInitialized) {
+        printError("Cannot change MAC while Bluetooth is active. Use 'bt reset' first.");
+        return;
+    }
+
+    if(mac.length() != 17) {
+        printError("Invalid MAC format. Use XX:XX:XX:XX:XX:XX");
+        return;
+    }
+
+    btSpoofedMAC = mac;
+    printSuccess("MAC address set to " + mac + " (will apply on next bt start)");
+}
+
+void btSniff() {
+    if(!bluetoothInitialized) {
+        btBegin();
+    }
+
+    if(btSniffing) {
+        printWarning("Sniffing already active");
+        return;
+    }
+
+    printInfo("Starting Bluetooth traffic sniffer...");
+    btSniffing = true;
+    btSniffLog.clear();
+
+    // Start passive scanning
+    pBLEScan = NimBLEDevice::getScan();
+    pBLEScan->setAdvertisedDeviceCallbacks(new class : public NimBLEAdvertisedDeviceCallbacks {
+        void onResult(NimBLEAdvertisedDevice* advertisedDevice) {
+            if(!btSniffing) return;
+
+            String entry = "";
+            entry += String(millis()) + "ms ";
+            entry += advertisedDevice->getAddress().toString().c_str();
+            entry += " RSSI:" + String(advertisedDevice->getRSSI());
+            entry += " " + String(advertisedDevice->getName().c_str());
+
+            printData("SNIFF: " + entry);
+
+            if(btSniffLog.size() > 50) btSniffLog.pop_front();
+            btSniffLog.push_back(entry);
+            safeYield();
+        }
+    });
+
+    pBLEScan->setActiveScan(false); // Passive scanning
+    pBLEScan->start(0, false); // Continuous scan
+
+    printInfo("Sniffer active. Press any key to view log, 'bt sniff' again to stop");
+}
+
+void btSniffStop() {
+    if(!btSniffing) return;
+
+    btSniffing = false;
+    if(pBLEScan) {
+        pBLEScan->stop();
+    }
+
+    printInfo("Bluetooth sniffer stopped");
+    if(!btSniffLog.empty()) {
+        printHeader("Sniff Log (" + String(btSniffLog.size()) + " entries):");
+        for(const auto& entry : btSniffLog) {
+            println(entry);
+        }
+    }
+}
+
+void btServer(const String& name) {
+    if(!bluetoothInitialized) {
+        btBegin();
+    }
+
+    if(bleServerStarted) {
+        printWarning("BLE server already running");
+        return;
+    }
+
+    String serverName = name.length() > 0 ? name : btDeviceName;
+    printInfo("Starting BLE HID server: " + serverName);
+
+    pServer = NimBLEDevice::createServer();
+    pHID = new NimBLEHIDDevice(pServer);
+
+    // Set up HID device info
+    pHID->manufacturer()->setValue("ESP32-BusPirate");
+    pHID->pnp(0x02, 0x05ac, 0x820a, 0x0210); // Apple-like PnP ID
+    pHID->hidInfo(0x00, 0x01);
+
+    // Add keyboard and mouse report maps
+    pHID->reportMap((uint8_t*)hidReportMapKeyboard, sizeof(hidReportMapKeyboard));
+    pHID->startServices();
+
+    // Start advertising
+    NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+    pAdvertising->setAppearance(HID_KEYBOARD);
+    pAdvertising->addServiceUUID(pHID->hidService()->getUUID());
+    pAdvertising->setScanResponse(true);
+    pAdvertising->start();
+
+    bleServerStarted = true;
+    printSuccess("BLE HID server started as '" + serverName + "'");
+}
+
+void btKeyboard() {
+    if(!bleServerStarted) {
+        printError("BLE server not running. Use 'bt server' first");
+        return;
+    }
+
+    if(btKeyboardBridge) {
+        btKeyboardBridge = false;
+        printInfo("Keyboard bridge stopped");
+        return;
+    }
+
+    btKeyboardBridge = true;
+    printInfo("Keyboard bridge active. Type to send keystrokes. Press ESC to stop.");
+
+    while(btKeyboardBridge) {
+        if(USB.available()) {
+            char c = USB.read();
+            if(c == 27) { // ESC
+                btKeyboardBridge = false;
+                break;
+            }
+
+            // Send keystroke via HID
+            uint8_t keycode = 0;
+            uint8_t modifier = 0;
+
+            // Simple ASCII to HID keycode mapping
+            if(c >= 'a' && c <= 'z') keycode = c - 'a' + 0x04;
+            else if(c >= 'A' && c <= 'Z') { keycode = c - 'A' + 0x04; modifier = 0x02; }
+            else if(c >= '1' && c <= '9') keycode = c - '1' + 0x1E;
+            else if(c == '0') keycode = 0x27;
+            else if(c == ' ') keycode = 0x2C;
+            else if(c == '\n' || c == '\r') keycode = 0x28;
+
+            if(keycode > 0) {
+                uint8_t report[] = {modifier, 0, keycode, 0, 0, 0, 0, 0};
+                pHID->inputReport(1, report, sizeof(report));
+                delay(10);
+
+                // Release key
+                memset(report, 0, sizeof(report));
+                pHID->inputReport(1, report, sizeof(report));
+                delay(10);
+            }
+        }
+        safeYield();
+    }
+
+    printInfo("Keyboard bridge stopped");
+}
+
+void btKeyboardSend(const String& text) {
+    if(!bleServerStarted) {
+        printError("BLE server not running. Use 'bt server' first");
+        return;
+    }
+
+    printInfo("Sending text: " + text);
+
+    for(int i = 0; i < text.length(); i++) {
+        char c = text[i];
+        uint8_t keycode = 0;
+        uint8_t modifier = 0;
+
+        // Simple ASCII to HID keycode mapping
+        if(c >= 'a' && c <= 'z') keycode = c - 'a' + 0x04;
+        else if(c >= 'A' && c <= 'Z') { keycode = c - 'A' + 0x04; modifier = 0x02; }
+        else if(c >= '1' && c <= '9') keycode = c - '1' + 0x1E;
+        else if(c == '0') keycode = 0x27;
+        else if(c == ' ') keycode = 0x2C;
+        else if(c == '\n' || c == '\r') keycode = 0x28;
+
+        if(keycode > 0) {
+            uint8_t report[] = {modifier, 0, keycode, 0, 0, 0, 0, 0};
+            pHID->inputReport(1, report, sizeof(report));
+            delay(20);
+
+            // Release key
+            memset(report, 0, sizeof(report));
+            pHID->inputReport(1, report, sizeof(report));
+            delay(20);
+        }
+        safeYield();
+    }
+
+    printSuccess("Text sent");
+}
+
+void btMouseMove(int x, int y) {
+    if(!bleServerStarted) {
+        printError("BLE server not running. Use 'bt server' first");
+        return;
+    }
+
+    // Clamp values to signed 8-bit range
+    x = std::max(-127, std::min(127, x));
+    y = std::max(-127, std::min(127, y));
+
+    uint8_t report[] = {0, (uint8_t)x, (uint8_t)y};
+    pHID->inputReport(2, report, sizeof(report));
+
+    printData("Mouse moved: (" + String(x) + ", " + String(y) + ")");
+}
+
+void btMouseClick() {
+    if(!bleServerStarted) {
+        printError("BLE server not running. Use 'bt server' first");
+        return;
+    }
+
+    // Left click press
+    uint8_t report[] = {0x01, 0, 0};
+    pHID->inputReport(2, report, sizeof(report));
+    delay(50);
+
+    // Release
+    report[0] = 0x00;
+    pHID->inputReport(2, report, sizeof(report));
+
+    printData("Mouse left-click sent");
+}
+
+void btMouseJiggleStart(uint32_t intervalMs) {
+    if(!bleServerStarted) {
+        printError("BLE server not running. Use 'bt server' first");
+        return;
+    }
+
+    btMouseJiggleInterval = std::max<uint32_t>(100, intervalMs);
+    btMouseJiggle = true;
+    btMouseJiggleNext = millis();
+
+    printInfo("Mouse jiggle started (every " + String(btMouseJiggleInterval) + "ms). Press ENTER to stop.");
+}
+
+void btMouseJiggleStop() {
+    if(!btMouseJiggle) return;
+
+    btMouseJiggle = false;
+    printInfo("Mouse jiggle stopped");
+}
+
+void btStatus() {
+    printHeader("=== Bluetooth Status ===");
+
+    println("Initialized:     " + String(bluetoothInitialized ? "Yes" : "No"));
+    if(bluetoothInitialized) {
+        println("Device Name:     " + btDeviceName);
+        println("MAC Address:     " + String(NimBLEDevice::getAddress().toString().c_str()));
+        if(btSpoofedMAC.length() > 0) {
+            println("Spoofed MAC:     " + btSpoofedMAC);
+        }
+    }
+
+    println("BLE Server:      " + String(bleServerStarted ? "Running" : "Stopped"));
+    println("Sniffing:        " + String(btSniffing ? "Active" : "Inactive"));
+    println("Keyboard Bridge: " + String(btKeyboardBridge ? "Active" : "Inactive"));
+    println("Mouse Jiggle:    " + String(btMouseJiggle ? "Active (" + String(btMouseJiggleInterval) + "ms)" : "Inactive"));
+
+    if(btScanResults.size() > 0) {
+        println("Last Scan:       " + String(btScanResults.size()) + " devices found");
+    }
+
+    if(btSniffLog.size() > 0) {
+        println("Sniff Log:       " + String(btSniffLog.size()) + " entries");
+    }
+}
+
+void btReset() {
+    printInfo("Resetting Bluetooth subsystem...");
+    btEnd();
+    delay(100);
+    printSuccess("Bluetooth reset complete");
+}
+
+void serviceBluetooth() {
+    if(!bluetoothInitialized) return;
+
+    // Handle mouse jiggle
+    if(btMouseJiggle && millis() >= btMouseJiggleNext) {
+        int dx = random(-5, 6);
+        int dy = random(-5, 6);
+        btMouseMove(dx, dy);
+        btMouseJiggleNext = millis() + btMouseJiggleInterval;
+
+        // Check for user input to stop jiggle
+        if(USB.available()) {
+            char c = USB.read();
+            if(c == '\n' || c == '\r') {
+                btMouseJiggleStop();
+            }
+        }
+    }
+
+    safeYield();
+}
+
+#endif
+
 // -------- GPIO --------
 void gpioSet(int pin, int val) {
     // Avoid problematic pins
@@ -1655,8 +2230,16 @@ void help() {
     println("  <Enter>           - Repeat last command");
     println("");
     println("MODES:");
-    println("  mode <m>, m <m>   - Set mode: hiz|h, gpio|g, i2c|i, spi|s, uart|u");
-    println("  Examples: 'm i' = I2C mode, 'm h' = Hi-Z safe mode");
+    println("  mode <m>, m <m>   - Set mode: hiz|h, gpio|g, i2c|i, spi|s, uart|u"
+#if ENABLE_BLUETOOTH
+    ", bluetooth|bt|b"
+#endif
+    );
+    println("  Examples: 'm i' = I2C mode, 'm h' = Hi-Z safe mode"
+#if ENABLE_BLUETOOTH
+    ", 'm bt' = Bluetooth mode"
+#endif
+    );
     println("");
     println("I2C COMMANDS: (requires 'mode i2c' first)");
     println("  i2c scan          - Scan for devices");
@@ -1686,6 +2269,23 @@ void help() {
     println("  gpio set <pin> <val> - Set output: 'gpio set 2 1' (HIGH)");
     println("  gpio get <pin>    - Read input: 'gpio get 4'");
     println("");
+#if ENABLE_BLUETOOTH
+    println("BLUETOOTH COMMANDS:");
+    println("  bt scan [seconds] - Scan for Bluetooth devices (default 10s)");
+    println("  bt pair <mac>     - Attempt to pair with device");
+    println("  bt spoof <mac>    - Set spoofed MAC (run before other commands)");
+    println("  bt sniff          - Start/stop passive traffic sniffer");
+    println("  bt server [name]  - Start BLE HID server");
+    println("  bt keyboard       - Bridge mode: forward terminal as HID keyboard");
+    println("  bt keyboard <text>- Send text string as HID keyboard");
+    println("  bt mouse <x> <y>  - Send relative mouse movement");
+    println("  bt mouse move <x> <y> - Alternative mouse movement syntax");
+    println("  bt mouse click    - Send left mouse click");
+    println("  bt mouse jiggle [ms] - Auto-jiggle mouse (default 1000ms)");
+    println("  bt status         - Show Bluetooth status");
+    println("  bt reset          - Reset Bluetooth subsystem");
+    println("");
+#endif
     println("Note: Serial-only version (3.3V max, 12mA max per pin)");
 }
 
@@ -1699,7 +2299,7 @@ void showPins() {
 void showStatus() {
     showStatusBarLine();
     printHeader("=== System Status ===");
-    String modeStr = (mode == HIZ ? "Hi-Z (Safe)" : mode == GPIO_MODE ? "GPIO" : mode == I2C_MODE ? "I2C" : mode == SPI_MODE ? "SPI" : "UART");
+    String modeStr = (mode == HIZ ? "Hi-Z (Safe)" : mode == GPIO_MODE ? "GPIO" : mode == I2C_MODE ? "I2C" : mode == SPI_MODE ? "SPI" : mode == UART_MODE ? "UART" : "Bluetooth");
     println("Mode:        " + modeStr);
     println("Free Heap:   " + String(ESP.getFreeHeap()/1024) + "KB (" + String(ESP.getFreeHeap()) + " bytes)");
     println("UART Buffer: " + String(uart_avail()) + "/" + String(UART_BUF_SZ) + " bytes" + (uart_avail() > 0 ? " [DATA WAITING]" : ""));
@@ -1812,7 +2412,14 @@ void handleCmd(const String& line) {
         else if(m=="i2c"||m=="i") { i2cBegin(); mode=I2C_MODE; }
         else if(m=="spi"||m=="s") { spiBegin(); mode=SPI_MODE; }
         else if(m=="uart"||m=="u") { uartBegin(); mode=UART_MODE; }
-        else { println("ERROR: Invalid mode. Use: hiz|h, gpio|g, i2c|i, spi|s, uart|u"); }
+#if ENABLE_BLUETOOTH
+        else if(m=="bluetooth"||m=="bt"||m=="b") { btBegin(); mode=BLUETOOTH_MODE; }
+#endif
+        else { println("ERROR: Invalid mode. Use: hiz|h, gpio|g, i2c|i, spi|s, uart|u"
+#if ENABLE_BLUETOOTH
+        ", bluetooth|bt|b"
+#endif
+        ); }
         return;
     }
     
@@ -1866,7 +2473,7 @@ void handleCmd(const String& line) {
     // Protocol-specific commands with mode checks
     if(c=="i2c" && v.size()>=2) {
         if(mode != I2C_MODE) {
-            println("ERROR: Not in I2C mode (currently in " + String(mode == HIZ ? "HiZ" : mode == GPIO_MODE ? "GPIO" : mode == SPI_MODE ? "SPI" : "UART") + ")");
+            println("ERROR: Not in I2C mode (currently in " + String(mode == HIZ ? "HiZ" : mode == GPIO_MODE ? "GPIO" : mode == SPI_MODE ? "SPI" : mode == UART_MODE ? "UART" : "Bluetooth") + ")");
             println("Use 'mode i2c' or 'm i' to switch to I2C mode first.");
             return;
         }
@@ -1978,7 +2585,7 @@ void handleCmd(const String& line) {
         cmd.toLowerCase();
         bool needsMode = (cmd != "config");
         if(needsMode && mode != SPI_MODE) {
-            println("ERROR: Not in SPI mode (currently in " + String(mode == HIZ ? "HiZ" : mode == GPIO_MODE ? "GPIO" : mode == I2C_MODE ? "I2C" : "UART") + ")");
+            println("ERROR: Not in SPI mode (currently in " + String(mode == HIZ ? "HiZ" : mode == GPIO_MODE ? "GPIO" : mode == I2C_MODE ? "I2C" : mode == UART_MODE ? "UART" : "Bluetooth") + ")");
             println("Use 'mode spi' or 'm s' to switch to SPI mode first.");
             return;
         }
@@ -2166,6 +2773,115 @@ void handleCmd(const String& line) {
         }
     }
 
+#if ENABLE_BLUETOOTH
+    if(c=="bt" || c=="bluetooth") {
+        if(v.size() < 2) {
+            btStatus();
+            return;
+        }
+
+        String cmd = v[1];
+        cmd.toLowerCase();
+
+        if(cmd=="scan") {
+            int seconds = (v.size() >= 3) ? constrain(v[2].toInt(), 1, 60) : 10;
+            btScan(seconds);
+            return;
+        }
+
+        if(cmd=="pair" && v.size() >= 3) {
+            btPair(v[2]);
+            return;
+        }
+
+        if(cmd=="spoof" && v.size() >= 3) {
+            btSpoof(v[2]);
+            return;
+        }
+
+        if(cmd=="sniff") {
+            if(btSniffing) {
+                btSniffStop();
+            } else {
+                btSniff();
+            }
+            return;
+        }
+
+        if(cmd=="status") {
+            btStatus();
+            return;
+        }
+
+        if(cmd=="server") {
+            String name = (v.size() >= 3) ? v[2] : "";
+            btServer(name);
+            return;
+        }
+
+        if(cmd=="keyboard") {
+            if(v.size() >= 3) {
+                // Extract the full text from the command line
+                int textStart = line.indexOf(v[2]);
+                String text = line.substring(textStart);
+                text.trim();
+
+                // Remove quotes if present
+                if(text.startsWith("\"") && text.endsWith("\"")) {
+                    text = text.substring(1, text.length()-1);
+                } else if(text.startsWith("'") && text.endsWith("'")) {
+                    text = text.substring(1, text.length()-1);
+                }
+
+                btKeyboardSend(text);
+            } else {
+                btKeyboard(); // Bridge mode
+            }
+            return;
+        }
+
+        if(cmd=="mouse") {
+            if(v.size() >= 4) {
+                if(v[2] == "move") {
+                    int x = v[3].toInt();
+                    int y = (v.size() >= 5) ? v[4].toInt() : 0;
+                    btMouseMove(x, y);
+                } else if(v[2] == "jiggle") {
+                    uint32_t interval = (v.size() >= 4) ? constrain((uint32_t)v[3].toInt(), 100, 60000) : 1000;
+                    if(btMouseJiggle) {
+                        btMouseJiggleStop();
+                    } else {
+                        btMouseJiggleStart(interval);
+                    }
+                } else if(v[2] == "click") {
+                    btMouseClick();
+                } else {
+                    // Direct x y coordinates
+                    int x = v[2].toInt();
+                    int y = v[3].toInt();
+                    btMouseMove(x, y);
+                }
+            } else if(v.size() == 3 && v[2] == "click") {
+                btMouseClick();
+            } else {
+                printError("Usage: bt mouse <x> <y> | bt mouse move <x> <y> | bt mouse click | bt mouse jiggle [ms]");
+            }
+            return;
+        }
+
+        if(cmd=="reset") {
+            btReset();
+            return;
+        }
+
+        // If we get here, unknown bt command
+        printError("Unknown Bluetooth command: " + cmd);
+        println("Available: scan, pair <mac>, spoof <mac>, sniff, server [name],");
+        println("           keyboard [text], mouse <x> <y>, mouse click, mouse jiggle [ms], status, reset");
+        return;
+    }
+#endif
+
     println("Unknown command: '" + c + "'");
     println("Type 'help' or 'h' for available commands.");
 
@@ -2255,6 +2971,11 @@ void loop() {
         serviceI2CMonitor();
     }
     serviceI2CSlave();
+
+#if ENABLE_BLUETOOTH
+    // Service Bluetooth activities
+    serviceBluetooth();
+#endif
 
     // Periodic maintenance
     checkHeap();
