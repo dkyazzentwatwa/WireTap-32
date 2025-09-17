@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an ESP32-based Bus Pirate implementation - a single-file Arduino sketch that creates a "mini Bus Pirate" with a serial terminal interface and optional OLED display. It provides protocol analysis capabilities for I2C, SPI, UART, and GPIO operations.
+This is an ESP32-based Bus Pirate implementation - a single-file Arduino sketch that creates a "mini Bus Pirate" with a serial terminal interface and optional OLED display. It provides protocol analysis capabilities for I2C, SPI, UART, GPIO, and **Bluetooth** operations.
 
-**Current Version**: Serial-only with SSD1306 OLED display support (WiFi/web interface removed for stability)
+**Current Version**: Bluetooth Experimental - includes full Bluetooth functionality with device scanning, pairing, HID operations, and traffic sniffing
 
 ## Build and Development
 
@@ -17,6 +17,9 @@ This is an ESP32-based Bus Pirate implementation - a single-file Arduino sketch 
   - Arduino ESP32 core libraries
   - Adafruit GFX Library
   - Adafruit SSD1306 Library
+  - **Bluetooth Libraries** (automatically included with ESP32 core):
+    - NimBLE-Arduino (memory-efficient BLE stack)
+    - BluetoothSerial (for Classic Bluetooth)
 
 ### No Traditional Build System
 This project uses the Arduino IDE's build system. There are no separate build scripts, package managers, or configuration files.
@@ -37,13 +40,14 @@ This project uses the Arduino IDE's build system. There are no separate build sc
 - **Stability System**: `safeYield()` and `checkHeap()` prevent watchdog resets during long operations
 
 ### State Management
-- **Mode System**: Global `mode` variable tracks current protocol (HIZ, GPIO_MODE, I2C_MODE, SPI_MODE, UART_MODE)
+- **Mode System**: Global `mode` variable tracks current protocol (HIZ, GPIO_MODE, I2C_MODE, SPI_MODE, UART_MODE, **BLUETOOTH_MODE**)
 - **Pin Configuration**: Global variables for pin assignments (PIN_I2C_SDA, PIN_SPI_MOSI, etc.) - configurable at runtime
 - **UART Buffering**: Circular buffer system for UART RX data with overflow protection
 - **Advanced State Tracking**:
   - I2C monitoring state with address, register, and interval settings
   - I2C slave mode with configurable address and TX values
   - UART bridge and spam mode active states
+  - **Bluetooth state management**: scan results, sniff logs, HID server status, device connections
   - Smart defaults and command history (last I2C address, read length, UART baud)
 
 ### Key Design Patterns
@@ -60,9 +64,9 @@ This project uses the Arduino IDE's build system. There are no separate build sc
 - Display: Uses I2C (SDA=21, SCL=22) at address 0x3C
 
 ## Common Operations
-- Set mode: `mode i2c|spi|uart|gpio|hiz`
+- Set mode: `mode i2c|spi|uart|gpio|hiz|bluetooth`
 - Configure pins: `pins set <name> <pin>`
-- Protocol operations: `i2c scan`, `spi x <hex>`, `uart tx <data>`
+- Protocol operations: `i2c scan`, `spi x <hex>`, `uart tx <data>`, `bt scan`
 - System info: `status`, `help`
 - Display control: `display on/off`
 - Advanced features:
@@ -70,6 +74,14 @@ This project uses the Arduino IDE's build system. There are no separate build sc
   - I2C slave mode: `i2c slave <addr> [tx_value]`
   - UART bridge: `uart bridge` (CTRL+] to exit)
   - UART spam: `uart spam <text> <period_ms>`
+  - **Bluetooth operations**:
+    - Device scanning: `bt scan [seconds]`
+    - Device pairing: `bt pair <mac>`
+    - MAC spoofing: `bt spoof <mac>`
+    - Traffic sniffing: `bt sniff`
+    - HID server: `bt server [name]`
+    - Keyboard emulation: `bt keyboard [text]`
+    - Mouse control: `bt mouse <x> <y>`, `bt mouse click`, `bt mouse jiggle [ms]`
   - Macro commands: `[0x50 0x00 r:8]` (I2C), `[0x9F r:3]` (SPI), `['Hello' r:10]` (UART)
   - Color toggle: `color on/off`
   - Status bar: `status bar on/off`
@@ -91,4 +103,10 @@ This project uses the Arduino IDE's build system. There are no separate build sc
 - Watchdog management functions are commented out to prevent boot loops
 - Includes `safeYield()` calls in loops to prevent blocking
 - Limited buffer sizes and operation timeouts prevent resource exhaustion
-- Serial-only design eliminates WiFi-related crashes and complexity
+- **Bluetooth Memory Management**:
+  - Uses NimBLE library for reduced memory consumption (~100KB less than standard BLE)
+  - Automatic heap monitoring with warnings when memory < 80KB
+  - Clean shutdown and resource cleanup for all Bluetooth operations
+  - Conditional compilation allows disabling Bluetooth to save memory (`#define ENABLE_BLUETOOTH 0`)
+- **Memory Safety**: Bluetooth stack requires ~170KB RAM; remaining protocols may need to be disabled when BT is active
+- Enhanced stability through proper resource management and error handling
