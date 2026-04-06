@@ -25,6 +25,8 @@ This guide explains how to safely use the ESP32 Bus Pirate to analyze and test v
 2. Open Arduino IDE Serial Monitor (or terminal program)
 3. Set baud rate to **115200**
 4. You should see: `=== ESP32 Bus Pirate v3.0 (Serial-Only) ===`
+5. If your board has the OLED button hardware installed, the display menu uses GPIO 34/36/39
+6. The OLED display is on GPIO 5/4 on the reference board; protocol I2C uses GPIO 21/22
 
 ### 2. Basic Commands
 ```
@@ -34,6 +36,13 @@ mode <proto>  - Set protocol mode (hiz, gpio, i2c, spi, uart)
 pins          - Show current pin assignments
 pins set <name> <pin> - Change pin assignments
 ```
+
+### OLED Button Menu
+When the display and buttons are connected, use the on-device menu to inspect GPIOs without typing commands:
+- `Left` / `Right` move through menu items
+- `Center` selects the highlighted item, toggles the selected GPIO, or returns to the previous menu
+- The button wiring matches the reference board: `GPIO34`, `GPIO36`, and `GPIO39` with external pullups
+- The GPIO browser uses the same safe pin list as the reference sketch: `0, 2, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 32, 33`
 
 ## Protocol Usage
 

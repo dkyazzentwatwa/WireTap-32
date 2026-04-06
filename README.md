@@ -1,6 +1,6 @@
 # WireTap-32 - ESP32 Mini Bus Pirate
 
-A feature-rich, single-file ESP32 implementation of the classic Bus Pirate protocol analyzer. This version provides a stable, serial-only interface with optional OLED display support for embedded protocol debugging and analysis.
+A feature-rich, single-file ESP32 implementation of the classic Bus Pirate protocol analyzer. This version provides a stable serial interface with a simple OLED GPIO browser and status view driven by three physical buttons.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Arduino](https://img.shields.io/badge/Arduino-Compatible-green.svg)](https://www.arduino.cc/)
@@ -37,6 +37,11 @@ A feature-rich, single-file ESP32 implementation of the classic Bus Pirate proto
 - **Error Recovery**: Robust error handling and safe pin states
 - **Serial Only**: Eliminates WiFi complexity for maximum reliability
 
+### 🖲️ Local Controls
+- **3-Button OLED Menu**: Navigate a GPIO browser and status screen with the board buttons
+- **Hardware Match**: Uses GPIO 34/36/39 with external pullups on the reference board
+- **Quick GPIO Test**: Browse safe pins, see their state, and toggle them from the display
+
 ### 🎨 User Experience
 - **Color Terminal**: ANSI color support for better readability
 - **Smart Defaults**: Remembers last used addresses and settings
@@ -49,6 +54,7 @@ A feature-rich, single-file ESP32 implementation of the classic Bus Pirate proto
 ### Basic Setup
 - **ESP32 Development Board** (any variant)
 - **USB Cable** for programming and serial communication
+- **3 tactile buttons** if you want the OLED menu navigation hardware
 
 ### Optional Display (Recommended)
 - **SSD1306 OLED Display** (128x64, 0.96", I2C interface)
@@ -62,7 +68,8 @@ Connect your target devices to the configurable GPIO pins (defaults shown):
 | I2C | SDA, SCL | 21, 22 |
 | SPI | MOSI, MISO, SCK, CS | 23, 19, 18, 5 |
 | UART | TX, RX | 17, 16 |
-| Display | SDA, SCL (shared with I2C) | 21, 22 |
+| Display | SDA, SCL | 5, 4 |
+| Buttons | LEFT, CENTER, RIGHT | 34, 36, 39 |
 
 ## Quick Start
 
@@ -76,12 +83,12 @@ In Arduino IDE, install these libraries via Library Manager:
 ESP32 → SSD1306 Display (optional)
   3.3V → VCC
   GND  → GND
-  GPIO21 (SDA) → SDA
-  GPIO22 (SCL) → SCL
+  GPIO5 (SDA) → SDA
+  GPIO4 (SCL) → SCL
 ```
 
 ### 3. Upload Code
-1. Open `ESP32_BusPirate_Stable.ino` in Arduino IDE
+1. Open `WireTap-32.ino` in Arduino IDE
 2. Select **Tools → Board → ESP32 Dev Module**
 3. Select your COM port
 4. Click Upload
@@ -90,6 +97,7 @@ ESP32 → SSD1306 Display (optional)
 1. Open Serial Monitor at **115200 baud**
 2. Type `help` to see all available commands
 3. Start with `mode i2c` then `i2c scan` to find devices
+4. If the OLED/button hardware is installed, use `L/R` to move and `C` to select in the menu
 
 ## Command Reference
 
@@ -140,12 +148,13 @@ gpio get 4             # Read pin 4 state
 
 When connected, the OLED display shows:
 - **System Status**: ESP32 Bus Pirate title
-- **Current Mode**: HiZ, I2C, SPI, UART, GPIO
+- **GPIO Browser**: One safe pin at a time with `HIGH`, `LOW`, or `INPUT` state
 - **Memory Usage**: Free heap in KB
 - **Uptime**: System uptime in seconds
 - **Protocol Info**: Frequency, baud rate, buffer status
+- **Button Menu**: 3-button navigation for GPIO browsing and status screens
 
-The display updates every 500ms and can be toggled with `display on/off` commands.
+The display updates every 500ms and can be toggled with `display on/off` commands. The physical buttons use `L/R` to navigate and `C` to select, toggle, or return.
 
 ## Technical Details
 

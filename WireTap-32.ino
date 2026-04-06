@@ -23,6 +23,7 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 bool displayEnabled = false;
 unsigned long lastDisplayUpdate = 0;
+TwoWire TargetWire(1);
 
 // -------- CLI IO --------
 HardwareSerial& USB = Serial;
@@ -75,6 +76,57 @@ uint8_t SPI_MODE_CFG = SPI_MODE0;
 uint8_t SPI_BIT_ORDER = MSBFIRST;
 bool I2C_PULLUPS = true;
 
+// -------- OLED Button Menu --------
+static const uint8_t BTN_LEFT_PIN = 34;
+static const uint8_t BTN_CENTER_PIN = 36;
+static const uint8_t BTN_RIGHT_PIN = 39;
+static const unsigned long BUTTON_DEBOUNCE_MS = 50;
+static const unsigned long UI_REFRESH_MS = 500;
+
+enum UiScreen {
+    UI_MAIN_MENU,
+    UI_GPIO_MENU,
+    UI_STATUS_VIEW,
+};
+
+enum MainMenuItem {
+    MENU_GPIO = 0,
+    MENU_STATUS = 1
+};
+
+static const uint8_t GPIO_MENU_PINS[] = {
+    0, 2, 12, 13, 14, 15, 16, 17, 18,
+    19, 21, 22, 23, 25, 26, 32, 33
+};
+static const uint8_t GPIO_MENU_PIN_COUNT = sizeof(GPIO_MENU_PINS) / sizeof(GPIO_MENU_PINS[0]);
+static const uint8_t GPIO_MENU_EXIT_INDEX = GPIO_MENU_PIN_COUNT;
+
+struct Button {
+    uint8_t pin;
+    bool lastRaw;
+    bool stable;
+    unsigned long lastChangeTime;
+    bool pressEvent;
+};
+
+Button buttons[3] = {
+    {BTN_LEFT_PIN,   true, true, 0, false},
+    {BTN_CENTER_PIN, true, true, 0, false},
+    {BTN_RIGHT_PIN,  true, true, 0, false}
+};
+
+const char* mainMenuItems[] = {
+    "GPIO",
+    "Status"
+};
+
+UiScreen uiScreen = UI_MAIN_MENU;
+uint8_t mainMenuIndex = 0;
+uint8_t gpioMenuIndex = 0;
+bool gpioMenuDriven[GPIO_MENU_PIN_COUNT] = {false};
+bool gpioMenuState[GPIO_MENU_PIN_COUNT] = {false};
+bool screenDirty = true;
+
 // -------- Mode state helpers --------
 bool uartBridgeActive = false;
 bool uartSpamActive = false;
@@ -96,6 +148,10 @@ uint8_t i2cSlaveAddress = 0x00;
 uint8_t i2cSlaveTxValue = 0x00;
 
 // Forward declarations
+void initButtons();
+void updateButtons();
+void handleButtonPresses();
+void initGpioMenuPins();
 void serviceUARTRx();
 void serviceI2CSlave();
 void i2cMonitorStop(bool silent = false);
@@ -105,6 +161,15 @@ bool readLineBlocking(String promptText, String& out, unsigned long timeoutMs = 
 std::vector<String> tok(const String& s);
 std::vector<uint8_t> parseHexBytes(const std::vector<String>& v, size_t start);
 bool parseHexByteToken(const String& token, uint8_t& value);
+size_t uart_avail();
+void flushUartBuffer();
+size_t uart_popN(uint8_t* out, size_t maxN);
+void setScreenDirty();
+void renderCurrentScreen();
+void renderMainMenu();
+void renderGpioMenu();
+void renderStatusView();
+void toggleSelectedGpio();
 
 // -------- UART target --------
 HardwareSerial TargetUART(2);
@@ -185,10 +250,21 @@ void printHeader(const String& s) {
     else _out_raw(s + "\n");
 }
 
+const char* getModeName(Mode m) {
+    switch(m) {
+        case HIZ: return "Hi-Z";
+        case GPIO_MODE: return "GPIO";
+        case I2C_MODE: return "I2C";
+        case SPI_MODE: return "SPI";
+        case UART_MODE: return "UART";
+        default: return "Unknown";
+    }
+}
+
 void showStatusBarLine() {
     if(!showStatusBar) return;
 
-    String modeStr = (mode == HIZ ? "HiZ" : mode == GPIO_MODE ? "GPIO" : mode == I2C_MODE ? "I2C" : mode == SPI_MODE ? "SPI" : "UART");
+    String modeStr = String(getModeName(mode));
     String heapStr = String(ESP.getFreeHeap()/1024) + "KB";
     String uptimeStr = String(millis()/1000) + "s";
 
@@ -237,6 +313,10 @@ void prompt() {
     }
 }
 
+void setScreenDirty() {
+    screenDirty = true;
+}
+
 // -------- Display Functions --------
 void displayInit() {
     // Try to initialize display
@@ -247,7 +327,7 @@ void displayInit() {
         display.setTextColor(SSD1306_WHITE);
         display.setCursor(0, 0);
         display.println("ESP32 Bus Pirate");
-        display.println("v3.0 Serial");
+        display.println("v3.0 Buttons");
         display.println("Starting...");
         display.display();
         printSuccess("SSD1306 display initialized");
@@ -257,71 +337,224 @@ void displayInit() {
     }
 }
 
-void displayUpdate() {
-    if(!displayEnabled) return;
+void renderMainMenu() {
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("== MAIN MENU ==");
+    display.println();
+    for(uint8_t i = 0; i < 2; i++) {
+        display.print(i == mainMenuIndex ? "> " : "  ");
+        display.println(mainMenuItems[i]);
+    }
+    display.println();
+    display.println("L/R:nav  C:select");
+}
 
-    // Only update every 500ms to reduce I2C traffic
-    if(millis() - lastDisplayUpdate < 500) return;
-    lastDisplayUpdate = millis();
+const char* gpioMenuLabel(uint8_t index) {
+    if(index >= GPIO_MENU_PIN_COUNT) return "EXIT";
+    uint8_t pin = GPIO_MENU_PINS[index];
+    switch(pin) {
+        case 0: return "IO0";
+        case 2: return "IO2";
+        case 12: return "IO12";
+        case 13: return "IO13";
+        case 14: return "IO14";
+        case 15: return "IO15";
+        case 16: return "IO16";
+        case 17: return "IO17";
+        case 18: return "IO18";
+        case 19: return "IO19";
+        case 21: return "IO21";
+        case 22: return "IO22";
+        case 23: return "IO23";
+        case 25: return "IO25";
+        case 26: return "IO26";
+        case 32: return "IO32";
+        case 33: return "IO33";
+        default: return "IO?";
+    }
+}
 
+String gpioMenuStateLabel(uint8_t index) {
+    if(index >= GPIO_MENU_PIN_COUNT) return "EXIT";
+    return digitalRead(GPIO_MENU_PINS[index]) == HIGH ? "HIGH" : "LOW";
+}
+
+const char* gpioMenuDriveLabel(uint8_t index) {
+    if(index >= GPIO_MENU_PIN_COUNT) return "";
+    return gpioMenuDriven[index] ? "OUTPUT" : "INPUT";
+}
+
+String gpioMenuHeader(uint8_t pin) {
+    if(pin == 23 || pin == 19 || pin == 18 || pin == 25 || pin == 26) return "H1";
+    if(pin == 13 || pin == 12 || pin == 14 || pin == 15 || pin == 21 || pin == 22 || pin == 17 || pin == 16) return "H2";
+    if(pin == 33 || pin == 32 || pin == 2 || pin == 0) return "H3";
+    return "??";
+}
+
+void renderGpioMenu() {
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("== GPIO ==");
+    display.println();
+    if(gpioMenuIndex >= GPIO_MENU_EXIT_INDEX) {
+        display.println("> EXIT");
+        display.println();
+        display.println("C: main menu");
+        return;
+    }
+
+    uint8_t pin = GPIO_MENU_PINS[gpioMenuIndex];
+    display.print("Pin ");
+    display.println(gpioMenuLabel(gpioMenuIndex));
+    display.println();
+    display.print("State: ");
+    display.println(gpioMenuStateLabel(gpioMenuIndex));
+    display.print("Drive: ");
+    display.println(gpioMenuDriveLabel(gpioMenuIndex));
+    display.print("Header: ");
+    display.println(gpioMenuHeader(pin));
+    display.print("Item: ");
+    display.print(gpioMenuIndex + 1);
+    display.print("/");
+    display.println(GPIO_MENU_PIN_COUNT);
+    display.println();
+    display.println("L/R: browse");
+    display.println("C: toggle");
+}
+
+void renderCurrentScreen() {
     display.clearDisplay();
     display.setCursor(0, 0);
 
-    // Title
-    display.setTextSize(1);
-    display.println("ESP32 Bus Pirate");
+    switch(uiScreen) {
+        case UI_MAIN_MENU: renderMainMenu(); break;
+        case UI_GPIO_MENU: renderGpioMenu(); break;
+        case UI_STATUS_VIEW: renderStatusView(); break;
+    }
+}
 
-    // Mode
-    String modeStr = (mode == HIZ ? "HiZ" : mode == GPIO_MODE ? "GPIO" :
-                     mode == I2C_MODE ? "I2C" : mode == SPI_MODE ? "SPI" : "UART");
-    display.print("Mode: ");
-    display.println(modeStr);
+void displayUpdate() {
+    if(!displayEnabled) return;
 
-    // Heap
-    display.print("Heap: ");
-    display.print(ESP.getFreeHeap()/1024);
-    display.println("KB");
-
-    // Uptime
-    display.print("Up: ");
-    display.print(millis()/1000);
-    display.println("s");
-
-    // Protocol specific info
-    if(mode == I2C_MODE) {
-        display.print("I2C: ");
-        display.print(I2C_FREQ/1000);
-        display.println("kHz");
-        display.print("Pull: ");
-        display.println(I2C_PULLUPS ? "ON" : "OFF");
-    } else if(mode == SPI_MODE) {
-        display.print("SPI: ");
-        display.print(SPI_FREQ/1000);
-        display.println("kHz");
-    } else if(mode == UART_MODE) {
-        display.print("UART: ");
-        display.println(UART_BAUD);
-        if(uart_avail() > 0) {
-            display.print("RX: ");
-            display.print(uart_avail());
-            display.println("B");
-        }
+    bool dynamicScreen = (uiScreen == UI_GPIO_MENU || uiScreen == UI_STATUS_VIEW);
+    if(!screenDirty) {
+        if(!dynamicScreen) return;
+        if(millis() - lastDisplayUpdate < UI_REFRESH_MS) return;
     }
 
+    lastDisplayUpdate = millis();
+    screenDirty = false;
+    renderCurrentScreen();
     display.display();
 }
 
-void setHiZ() {
-    printInfo("Setting Hi-Z mode...");
+void renderStatusView() {
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("== STATUS ==");
+    display.println();
+    display.print("Mode: ");
+    display.println(getModeName(mode));
+    display.print("Heap: ");
+    display.print(ESP.getFreeHeap() / 1024);
+    display.println("KB");
+    display.print("Uptime: ");
+    display.print(millis() / 1000);
+    display.println("s");
+    display.print("UART RX: ");
+    display.print(uart_avail());
+    display.println("B");
+    display.setCursor(0, 56);
+    display.println("Any key: back");
+}
 
-    // End peripherals safely
+void initGpioMenuPins() {
+    for(uint8_t i = 0; i < GPIO_MENU_PIN_COUNT; i++) {
+        pinMode(GPIO_MENU_PINS[i], INPUT);
+        gpioMenuDriven[i] = false;
+        gpioMenuState[i] = false;
+    }
+}
+
+void toggleSelectedGpio() {
+    if(gpioMenuIndex >= GPIO_MENU_EXIT_INDEX) {
+        uiScreen = UI_MAIN_MENU;
+        setScreenDirty();
+        return;
+    }
+
+    uint8_t pin = GPIO_MENU_PINS[gpioMenuIndex];
+    bool nextState = !gpioMenuState[gpioMenuIndex];
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, nextState ? HIGH : LOW);
+    gpioMenuDriven[gpioMenuIndex] = true;
+    gpioMenuState[gpioMenuIndex] = nextState;
+    setScreenDirty();
+}
+
+void handleButtonPresses() {
+    bool left = buttons[0].pressEvent;
+    bool center = buttons[1].pressEvent;
+    bool right = buttons[2].pressEvent;
+
+    if(!left && !center && !right) return;
+
+    if(uiScreen == UI_MAIN_MENU) {
+        if(left) {
+            mainMenuIndex = (mainMenuIndex + 1) % 2;
+            setScreenDirty();
+        }
+        if(right) {
+            mainMenuIndex = (mainMenuIndex + 1) % 2;
+            setScreenDirty();
+        }
+        if(center) {
+            if(mainMenuIndex == MENU_GPIO) {
+                uiScreen = UI_GPIO_MENU;
+                gpioMenuIndex = 0;
+            } else {
+                uiScreen = UI_STATUS_VIEW;
+            }
+            setScreenDirty();
+        }
+        displayUpdate();
+        return;
+    }
+
+    if(uiScreen == UI_GPIO_MENU) {
+        if(left) {
+            gpioMenuIndex = (gpioMenuIndex + GPIO_MENU_PIN_COUNT) % (GPIO_MENU_PIN_COUNT + 1);
+            setScreenDirty();
+        }
+        if(right) {
+            gpioMenuIndex = (gpioMenuIndex + 1) % (GPIO_MENU_PIN_COUNT + 1);
+            setScreenDirty();
+        }
+        if(center) {
+            toggleSelectedGpio();
+        }
+        displayUpdate();
+        return;
+    }
+
+    if(uiScreen == UI_STATUS_VIEW) {
+        uiScreen = UI_MAIN_MENU;
+        mainMenuIndex = MENU_GPIO;
+        setScreenDirty();
+        displayUpdate();
+    }
+}
+
+void stopActivePeripherals() {
     i2cMonitorStop(true);
     if(i2cSlaveMode) i2cSlaveStop(true);
-    Wire.end();
+    TargetWire.end();
     SPI.end();
     TargetUART.end();
+}
 
-    // Set pins to safe state
+void setAllBusPinsInput() {
     pinMode(PIN_I2C_SDA, INPUT);
     pinMode(PIN_I2C_SCL, INPUT);
     pinMode(PIN_SPI_MOSI, INPUT);
@@ -330,15 +563,34 @@ void setHiZ() {
     pinMode(PIN_SPI_CS, INPUT);
     pinMode(PIN_UART_TX, INPUT);
     pinMode(PIN_UART_RX, INPUT);
+}
+
+void setHiZ() {
+    printInfo("Setting Hi-Z mode...");
+
+    stopActivePeripherals();
+    setAllBusPinsInput();
 
     mode = HIZ;
     printSuccess("Hi-Z mode active - All pins safe");
+    setScreenDirty();
+    displayUpdate();
+}
+
+void enterGpioMode() {
+    printInfo("Setting GPIO mode...");
+    stopActivePeripherals();
+    setAllBusPinsInput();
+
+    mode = GPIO_MODE;
+    printSuccess("GPIO mode active - use gpio set/get");
+    setScreenDirty();
     displayUpdate();
 }
 
 // -------- I2C --------
 void i2cBegin() {
-    Wire.end();
+    TargetWire.end();
     safeYield();
     
     if(I2C_PULLUPS) {
@@ -346,12 +598,14 @@ void i2cBegin() {
         pinMode(PIN_I2C_SCL, INPUT_PULLUP);
     }
     
-    if (!Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQ)) {
+    if (!TargetWire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQ)) {
         printError("ERROR: I2C begin failed!");
         return;
     }
-    Wire.setTimeout(500); // Shorter timeout to prevent hanging
+    TargetWire.setTimeout(500); // Shorter timeout to prevent hanging
+    mode = I2C_MODE;
     printSuccess("I2C mode active - " + String(I2C_FREQ/1000) + "kHz, pullups " + String(I2C_PULLUPS ? "ON" : "OFF"));
+    setScreenDirty();
     displayUpdate();
 }
 
@@ -374,8 +628,8 @@ void i2cScan() {
             print("] " + String(addr*100/126) + "%\r");
         }
 
-        Wire.beginTransmission(addr);
-        uint8_t error = Wire.endTransmission();
+        TargetWire.beginTransmission(addr);
+        uint8_t error = TargetWire.endTransmission();
         if(error == 0) {
             print("                                        \r"); // Clear progress line
             printSuccess("Found device at 0x" + String(addr, HEX));
@@ -401,9 +655,9 @@ void i2cWrite(uint8_t addr, const std::vector<uint8_t>& bytes) {
         return;
     }
     
-    Wire.beginTransmission(addr);
-    size_t written = Wire.write(bytes.data(), bytes.size());
-    uint8_t rc = Wire.endTransmission();
+    TargetWire.beginTransmission(addr);
+    size_t written = TargetWire.write(bytes.data(), bytes.size());
+    uint8_t rc = TargetWire.endTransmission();
     
     printInfo("I2C WRITE -> 0x" + String(addr, HEX) + " [" + String(written) + "/" + String(bytes.size()) + " bytes]");
     printData("  Hex: " + toHex(bytes.data(), bytes.size()));
@@ -418,13 +672,13 @@ void i2cRead(uint8_t addr, size_t n) {
         return;
     }
     
-    uint8_t received = Wire.requestFrom((int)addr, (int)n);
+    uint8_t received = TargetWire.requestFrom((int)addr, (int)n);
     std::vector<uint8_t> buf;
     buf.reserve(n);
     
     unsigned long timeout = millis() + 100;
-    while(Wire.available() && buf.size() < n && millis() < timeout) {
-        buf.push_back(Wire.read());
+    while(TargetWire.available() && buf.size() < n && millis() < timeout) {
+        buf.push_back(TargetWire.read());
         safeYield();
     }
     
@@ -443,8 +697,8 @@ void i2cRead(uint8_t addr, size_t n) {
 }
 
 bool i2cDevicePresent(uint8_t addr) {
-    Wire.beginTransmission(addr);
-    return Wire.endTransmission() == 0;
+    TargetWire.beginTransmission(addr);
+    return TargetWire.endTransmission() == 0;
 }
 
 void i2cPing(uint8_t addr) {
@@ -476,13 +730,13 @@ void i2cIdentify(uint8_t addr) {
     printInfo("  Guess: " + i2cGuessDevice(addr));
 
     // Attempt to read two bytes for signature if possible
-    Wire.beginTransmission(addr);
-    Wire.write(0x00);
-    if(Wire.endTransmission(false) == 0) {
-        uint8_t got = Wire.requestFrom((int)addr, 2);
+    TargetWire.beginTransmission(addr);
+    TargetWire.write(0x00);
+    if(TargetWire.endTransmission(false) == 0) {
+        uint8_t got = TargetWire.requestFrom((int)addr, 2);
         if(got > 0) {
-            uint8_t a = Wire.read();
-            uint8_t b = (got > 1) ? Wire.read() : 0xFF;
+            uint8_t a = TargetWire.read();
+            uint8_t b = (got > 1) ? TargetWire.read() : 0xFF;
             printData("  Peek: 0x" + String(a, HEX) + " 0x" + String(b, HEX));
         }
     }
@@ -490,17 +744,17 @@ void i2cIdentify(uint8_t addr) {
 
 bool i2cReadRegister(uint8_t addr, uint8_t reg, size_t len, std::vector<uint8_t>& out, bool verbose = true) {
     out.clear();
-    Wire.beginTransmission(addr);
-    Wire.write(reg);
-    if(Wire.endTransmission(false) != 0) {
+    TargetWire.beginTransmission(addr);
+    TargetWire.write(reg);
+    if(TargetWire.endTransmission(false) != 0) {
         if(verbose) printError("I2C READ REG failed to write register 0x" + String(reg, HEX));
         return false;
     }
 
-    uint8_t received = Wire.requestFrom((int)addr, (int)len);
+    uint8_t received = TargetWire.requestFrom((int)addr, (int)len);
     unsigned long timeout = millis() + 200;
-    while(Wire.available() && out.size() < len && millis() < timeout) {
-        out.push_back(Wire.read());
+    while(TargetWire.available() && out.size() < len && millis() < timeout) {
+        out.push_back(TargetWire.read());
     }
 
     if(out.empty()) {
@@ -517,10 +771,10 @@ bool i2cReadRegister(uint8_t addr, uint8_t reg, size_t len, std::vector<uint8_t>
 
 bool i2cRequest(uint8_t addr, size_t len, std::vector<uint8_t>& out) {
     out.clear();
-    uint8_t got = Wire.requestFrom((int)addr, (int)len);
+    uint8_t got = TargetWire.requestFrom((int)addr, (int)len);
     unsigned long timeout = millis() + 200;
-    while(Wire.available() && out.size() < len && millis() < timeout) {
-        out.push_back(Wire.read());
+    while(TargetWire.available() && out.size() < len && millis() < timeout) {
+        out.push_back(TargetWire.read());
     }
     if(out.empty()) {
         printWarning("I2C READ <- 0x" + String(addr, HEX) + " [no data]");
@@ -531,12 +785,12 @@ bool i2cRequest(uint8_t addr, size_t len, std::vector<uint8_t>& out) {
 }
 
 void i2cWriteRegister(uint8_t addr, uint8_t reg, const std::vector<uint8_t>& values) {
-    Wire.beginTransmission(addr);
-    uint8_t written = Wire.write(reg);
+    TargetWire.beginTransmission(addr);
+    uint8_t written = TargetWire.write(reg);
     if(!values.empty()) {
-        written += Wire.write(values.data(), values.size());
+        written += TargetWire.write(values.data(), values.size());
     }
-    uint8_t rc = Wire.endTransmission();
+    uint8_t rc = TargetWire.endTransmission();
 
     String hexValues = values.empty() ? "" : toHex(values.data(), values.size());
     printInfo("I2C WRITE REG 0x" + String(addr, HEX) + "[0x" + String(reg, HEX) + "] " + hexValues);
@@ -549,16 +803,16 @@ void i2cDump(uint8_t addr, size_t len) {
     printInfo("I2C DUMP 0x" + String(addr, HEX) + " len=" + String(len));
     for(size_t offset = 0; offset < len; offset += 16) {
         size_t chunk = min((size_t)16, len - offset);
-        Wire.beginTransmission(addr);
-        Wire.write((uint8_t)(offset & 0xFF));
-        if(Wire.endTransmission(false) != 0) {
+        TargetWire.beginTransmission(addr);
+        TargetWire.write((uint8_t)(offset & 0xFF));
+        if(TargetWire.endTransmission(false) != 0) {
             printError("  Failed to set address pointer at 0x" + String(offset, HEX));
             break;
         }
 
-        uint8_t got = Wire.requestFrom((int)addr, (int)chunk);
+        uint8_t got = TargetWire.requestFrom((int)addr, (int)chunk);
         std::vector<uint8_t> data;
-        while(got-- && Wire.available()) data.push_back(Wire.read());
+        while(got-- && TargetWire.available()) data.push_back(TargetWire.read());
 
         if(data.empty()) {
             printWarning("  No data at 0x" + String(offset, HEX));
@@ -576,10 +830,10 @@ void i2cFlood(uint8_t addr, size_t count) {
     printWarning("Starting I2C flood on 0x" + String(addr, HEX) + " for " + String(count) + " iterations");
     for(size_t i = 0; i < count; i++) {
         uint8_t value = (uint8_t)esp_random();
-        Wire.beginTransmission(addr);
-        Wire.write((uint8_t)(i & 0xFF));
-        Wire.write(value);
-        uint8_t rc = Wire.endTransmission();
+        TargetWire.beginTransmission(addr);
+        TargetWire.write((uint8_t)(i & 0xFF));
+        TargetWire.write(value);
+        uint8_t rc = TargetWire.endTransmission();
         if(rc != 0) {
             printError("  Flood stopped at iteration " + String(i) + " rc=" + String(rc));
             break;
@@ -593,7 +847,7 @@ void i2cInjectGlitches(uint8_t addr, size_t count) {
     if(count == 0) count = 8;
     printWarning("Injecting " + String(count) + " glitch pulses targeting 0x" + String(addr, HEX));
 
-    Wire.end();
+    TargetWire.end();
     delay(2);
 
     pinMode(PIN_I2C_SDA, OUTPUT);
@@ -622,7 +876,7 @@ void i2cInjectGlitches(uint8_t addr, size_t count) {
 
 void i2cRecoverBus() {
     printWarning("Attempting I2C bus recovery (16 clock pulses + STOP)");
-    Wire.end();
+    TargetWire.end();
     delay(5);
 
     pinMode(PIN_I2C_SCL, OUTPUT);
@@ -788,16 +1042,16 @@ void i2cEepromShell(uint8_t addr) {
         if(cmd == "read" && parts.size() >= 2) {
             uint16_t offset = (uint16_t)strtoul(parts[1].c_str(), nullptr, 0);
             size_t len = (parts.size() >= 3) ? constrain((int)strtoul(parts[2].c_str(), nullptr, 0), 1, 64) : 16;
-            Wire.beginTransmission(addr);
-            Wire.write((uint8_t)(offset >> 8));
-            Wire.write((uint8_t)(offset & 0xFF));
-            if(Wire.endTransmission(false) != 0) {
+            TargetWire.beginTransmission(addr);
+            TargetWire.write((uint8_t)(offset >> 8));
+            TargetWire.write((uint8_t)(offset & 0xFF));
+            if(TargetWire.endTransmission(false) != 0) {
                 printError("Failed to set offset");
                 continue;
             }
-            uint8_t got = Wire.requestFrom((int)addr, (int)len);
+            uint8_t got = TargetWire.requestFrom((int)addr, (int)len);
             std::vector<uint8_t> data;
-            while(got-- && Wire.available()) data.push_back(Wire.read());
+            while(got-- && TargetWire.available()) data.push_back(TargetWire.read());
             if(data.empty()) {
                 printWarning("No data");
             } else {
@@ -812,11 +1066,11 @@ void i2cEepromShell(uint8_t addr) {
                 printError("No bytes to write");
                 continue;
             }
-            Wire.beginTransmission(addr);
-            Wire.write((uint8_t)(offset >> 8));
-            Wire.write((uint8_t)(offset & 0xFF));
-            Wire.write(bytes.data(), bytes.size());
-            uint8_t rc = Wire.endTransmission();
+            TargetWire.beginTransmission(addr);
+            TargetWire.write((uint8_t)(offset >> 8));
+            TargetWire.write((uint8_t)(offset & 0xFF));
+            TargetWire.write(bytes.data(), bytes.size());
+            uint8_t rc = TargetWire.endTransmission();
             if(rc == 0) {
                 printSuccess("Write queued; waiting for EEPROM cycle");
                 delay(10);
@@ -834,11 +1088,11 @@ void i2cEepromShell(uint8_t addr) {
             }
             size_t count = constrain((int)strtoul(parts[3].c_str(), nullptr, 0), 1, 64);
             std::vector<uint8_t> bytes(count, value);
-            Wire.beginTransmission(addr);
-            Wire.write((uint8_t)(offset >> 8));
-            Wire.write((uint8_t)(offset & 0xFF));
-            Wire.write(bytes.data(), bytes.size());
-            uint8_t rc = Wire.endTransmission();
+            TargetWire.beginTransmission(addr);
+            TargetWire.write((uint8_t)(offset >> 8));
+            TargetWire.write((uint8_t)(offset & 0xFF));
+            TargetWire.write(bytes.data(), bytes.size());
+            uint8_t rc = TargetWire.endTransmission();
             if(rc == 0) {
                 printSuccess("Fill queued; waiting");
                 delay(10);
@@ -857,8 +1111,8 @@ void i2cEepromShell(uint8_t addr) {
 void i2cSlaveReceive(int len) {
     String line = "I2C slave RX <- ";
     std::vector<uint8_t> data;
-    while(len-- > 0 && Wire.available()) {
-        uint8_t b = Wire.read();
+    while(len-- > 0 && TargetWire.available()) {
+        uint8_t b = TargetWire.read();
         data.push_back(b);
     }
     if(!data.empty()) line += toHex(data.data(), data.size());
@@ -868,7 +1122,7 @@ void i2cSlaveReceive(int len) {
 }
 
 void i2cSlaveRequest() {
-    Wire.write(i2cSlaveTxValue);
+    TargetWire.write(i2cSlaveTxValue);
     String line = "I2C slave TX -> 0x" + String(i2cSlaveTxValue, HEX);
     if(i2cSlaveLog.size() > 16) i2cSlaveLog.pop_front();
     i2cSlaveLog.push_back(line);
@@ -880,11 +1134,11 @@ void i2cSlaveStart(uint8_t addr, uint32_t durationMs) {
         return;
     }
     i2cMonitorStop(true);
-    Wire.end();
+    TargetWire.end();
     delay(5);
-    Wire.begin(addr, PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQ);
-    Wire.onReceive(i2cSlaveReceive);
-    Wire.onRequest(i2cSlaveRequest);
+    TargetWire.begin(addr, PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQ);
+    TargetWire.onReceive(i2cSlaveReceive);
+    TargetWire.onRequest(i2cSlaveRequest);
     i2cSlaveMode = true;
     i2cSlaveAddress = addr;
     i2cSlaveEnd = durationMs ? millis() + durationMs : 0;
@@ -895,9 +1149,9 @@ void i2cSlaveStart(uint8_t addr, uint32_t durationMs) {
 
 void i2cSlaveStop(bool silent) {
     if(!i2cSlaveMode) return;
-    Wire.onReceive(nullptr);
-    Wire.onRequest(nullptr);
-    Wire.end();
+    TargetWire.onReceive(nullptr);
+    TargetWire.onRequest(nullptr);
+    TargetWire.end();
     delay(5);
     i2cSlaveMode = false;
     i2cSlaveLog.clear();
@@ -925,7 +1179,9 @@ void spiBegin() {
     SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SPI_CS);
     pinMode(PIN_SPI_CS, OUTPUT);
     digitalWrite(PIN_SPI_CS, HIGH);
+    mode = SPI_MODE;
     println("SPI mode active - " + String(SPI_FREQ/1000) + "kHz mode " + String(SPI_MODE_CFG) + (SPI_BIT_ORDER == MSBFIRST ? " MSB" : " LSB"));
+    setScreenDirty();
     displayUpdate();
 }
 
@@ -1196,7 +1452,9 @@ void uartBegin() {
     TargetUART.flush();
     while(TargetUART.available()) TargetUART.read();
 
+    mode = UART_MODE;
     println("UART mode active - " + String(UART_BAUD) + " baud");
+    setScreenDirty();
     displayUpdate();
 }
 
@@ -1405,6 +1663,41 @@ void uartConfigCmd(const std::vector<String>& v) {
         return;
     }
     printError("Unknown UART config option");
+}
+
+void initButtons() {
+    for(uint8_t i = 0; i < 3; i++) {
+        pinMode(buttons[i].pin, INPUT);
+        buttons[i].lastRaw = digitalRead(buttons[i].pin);
+        buttons[i].stable = buttons[i].lastRaw;
+        buttons[i].lastChangeTime = millis();
+        buttons[i].pressEvent = false;
+    }
+}
+
+void updateButtons() {
+    unsigned long now = millis();
+
+    for(uint8_t i = 0; i < 3; i++) {
+        bool raw = digitalRead(buttons[i].pin);
+        buttons[i].pressEvent = false;
+
+        if(raw != buttons[i].lastRaw) {
+            buttons[i].lastChangeTime = now;
+            buttons[i].lastRaw = raw;
+        }
+
+        if((now - buttons[i].lastChangeTime) <= BUTTON_DEBOUNCE_MS) {
+            continue;
+        }
+
+        if(raw != buttons[i].stable) {
+            if(raw == LOW && buttons[i].stable == HIGH) {
+                buttons[i].pressEvent = true;
+            }
+            buttons[i].stable = raw;
+        }
+    }
 }
 
 // -------- UART RX buffer - FIXED --------
@@ -1808,10 +2101,10 @@ void handleCmd(const String& line) {
         String m=v[1];
         m.toLowerCase();
         if(m=="hiz"||m=="h") { setHiZ(); }
-        else if(m=="gpio"||m=="g") { mode=GPIO_MODE; println("GPIO mode active"); }
-        else if(m=="i2c"||m=="i") { i2cBegin(); mode=I2C_MODE; }
-        else if(m=="spi"||m=="s") { spiBegin(); mode=SPI_MODE; }
-        else if(m=="uart"||m=="u") { uartBegin(); mode=UART_MODE; }
+        else if(m=="gpio"||m=="g") { enterGpioMode(); }
+        else if(m=="i2c"||m=="i") { i2cBegin(); }
+        else if(m=="spi"||m=="s") { spiBegin(); }
+        else if(m=="uart"||m=="u") { uartBegin(); }
         else { println("ERROR: Invalid mode. Use: hiz|h, gpio|g, i2c|i, spi|s, uart|u"); }
         return;
     }
@@ -2202,7 +2495,7 @@ void handleInputStream(Stream& s) {
 void setup() {
     // Disable watchdog during setup (commented out to avoid WDT errors)
     // disableCore0WDT();
-    Wire.begin(21, 22);
+    Wire.begin(5, 4);
     USB.begin(115200);
     delay(2000); // Longer delay for stability
     
@@ -2214,6 +2507,12 @@ void setup() {
 
     // Initialize display after I2C is set up
     displayInit();
+    initButtons();
+    initGpioMenuPins();
+    mainMenuIndex = MENU_GPIO;
+    gpioMenuIndex = 0;
+    uiScreen = UI_MAIN_MENU;
+    setScreenDirty();
 
     USB.println("Ready! Type 'help' for commands.");
 
@@ -2222,6 +2521,7 @@ void setup() {
 
     // Show initial status bar
     showStatusBarLine();
+    displayUpdate();
 
     prompt();
 }
@@ -2236,6 +2536,9 @@ void loop() {
         return;
     }
     lastLoop = now;
+
+    updateButtons();
+    handleButtonPresses();
     
     // Service UART if in UART mode
     if (mode == UART_MODE) {
