@@ -10,6 +10,7 @@
 #include <deque>
 #include <algorithm>
 #include <esp_system.h>
+#include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
@@ -63,6 +64,16 @@ String flushCapture() {
 
 enum Mode {HIZ, GPIO_MODE, I2C_MODE, SPI_MODE, UART_MODE};
 Mode mode = HIZ;
+
+// -------- OLED display bus pins (Wire, separate from TargetWire) --------
+int PIN_DISP_SDA = 5, PIN_DISP_SCL = 4;
+
+// -------- Command history --------
+#define CMD_HISTORY_SIZE 10
+String cmdHistory[CMD_HISTORY_SIZE];
+uint8_t cmdHistoryHead  = 0;
+uint8_t cmdHistoryCount = 0;
+int8_t  cmdHistoryPos   = -1;   // -1 = not browsing history
 
 // -------- Default pins --------
 int PIN_I2C_SDA = 21, PIN_I2C_SCL = 22;
@@ -170,6 +181,17 @@ void renderMainMenu();
 void renderGpioMenu();
 void renderStatusView();
 void toggleSelectedGpio();
+void showPins();
+void gpioAdc(int pin);
+void gpioPwm(int pin, uint32_t freq, uint8_t dutyPct);
+void gpioFreq(int pin);
+void gpioPulse(int pin);
+void gpioScope(int pin, uint16_t samples, uint32_t intervalUs);
+void configSave();
+void configLoad();
+void configReset();
+void historyPush(const String& cmd);
+String historyGet(int8_t age);
 
 // -------- UART target --------
 HardwareSerial TargetUART(2);
@@ -711,12 +733,46 @@ void i2cPing(uint8_t addr) {
 }
 
 String i2cGuessDevice(uint8_t addr) {
-    if(addr == 0x3C || addr == 0x3D) return "Likely SSD1306/SH1106 OLED";
-    if(addr >= 0x50 && addr <= 0x57) return "Likely 24xx EEPROM";
-    if(addr == 0x68) return "Likely DS3231 RTC or MPU-6050";
-    if(addr == 0x76 || addr == 0x77) return "Likely BME280/BMP280 sensor";
-    if(addr == 0x20 || addr == 0x21) return "Likely MCP23017 IO expander";
-    if(addr == 0x40) return "Likely INA219/Si7021 sensor";
+    // Display controllers
+    if(addr == 0x3C || addr == 0x3D) return "SSD1306/SH1106/SSD1309 OLED display";
+    if(addr == 0x27 || addr == 0x3F) return "PCF8574 LCD backpack (HD44780)";
+    // EEPROMs
+    if(addr >= 0x50 && addr <= 0x57) return "24xx series EEPROM (24C02..24C512)";
+    // RTC / IMU
+    if(addr == 0x68) return "DS3231/DS1307 RTC or MPU-6050/MPU-6500 IMU";
+    if(addr == 0x69) return "MPU-6050/MPU-9250 IMU (AD0=HIGH)";
+    if(addr == 0x1C || addr == 0x1D) return "ADXL345 or MMA8452 accelerometer";
+    if(addr == 0x1E) return "HMC5883L / QMC5883 magnetometer";
+    if(addr == 0x53) return "ADXL345 accelerometer (ALT addr)";
+    if(addr == 0x19) return "LSM303 accelerometer or LIS3DH";
+    if(addr == 0x1F) return "LSM303 magnetometer";
+    if(addr == 0x6A || addr == 0x6B) return "LSM6DS3/LSM9DS1 IMU";
+    // Environmental sensors
+    if(addr == 0x76 || addr == 0x77) return "BME280/BMP280/BMP388 pressure/temp/humidity";
+    if(addr == 0x44 || addr == 0x45) return "SHT31/SHT35 temp+humidity sensor";
+    if(addr == 0x38) return "AHT10/AHT20/AHT21 temp+humidity sensor";
+    if(addr == 0x40) return "INA219 power monitor or Si7021 humidity sensor";
+    if(addr == 0x41) return "INA219 power monitor (A0=HIGH)";
+    if(addr == 0x59) return "SGP30 / ENS160 air quality sensor";
+    if(addr == 0x52) return "ENS160 air quality sensor";
+    if(addr == 0x29) return "VL53L0X / VL53L1X ToF distance sensor or TCS34725 color";
+    if(addr == 0x39) return "APDS-9960 gesture/proximity/color sensor";
+    if(addr == 0x23 || addr == 0x5C) return "BH1750 ambient light sensor";
+    if(addr == 0x36) return "MAX17048/MAX17049 LiPo fuel gauge";
+    if(addr == 0x48 || addr == 0x49 || addr == 0x4A || addr == 0x4B) return "ADS1115/ADS1015 ADC or TMP102 temp sensor";
+    // IO expanders
+    if(addr == 0x20 || addr == 0x21) return "MCP23017 16-bit IO expander or PCF8574";
+    if(addr == 0x22 || addr == 0x23) return "PCF8574 IO expander";
+    if(addr == 0x24 || addr == 0x25 || addr == 0x26) return "PCF8574 IO expander";
+    // DAC / other
+    if(addr == 0x60) return "MCP4725 12-bit DAC or Si5351 clock gen";
+    if(addr == 0x62 || addr == 0x63) return "Si5351 clock generator";
+    if(addr == 0x70) return "TCA9548A I2C multiplexer (all channels)";
+    if(addr >= 0x71 && addr <= 0x77) return "TCA9548A I2C multiplexer";
+    if(addr == 0x61) return "MCP4725 DAC (A0=HIGH)";
+    // Motor drivers
+    if(addr == 0x60 || addr == 0x61) return "PCA9685 16-ch PWM or MCP4725 DAC";
+    if(addr == 0x40 || addr == 0x41 || addr == 0x42 || addr == 0x43) return "PCA9685 PWM driver or INA21x monitor";
     return "Unknown device";
 }
 
@@ -1816,6 +1872,164 @@ int gpioGet(int pin) {
     return digitalRead(pin);
 }
 
+// -------- GPIO extended --------
+void gpioAdc(int pin) {
+    static const int adcOk[] = {32, 33, 34, 35, 36, 39, 25, 26, 27, 14, 12, 13, 4, 2, 15, 0, -1};
+    bool valid = false;
+    for(int i = 0; adcOk[i] != -1; i++) { if(pin == adcOk[i]) { valid = true; break; } }
+    if(!valid) {
+        printError("Pin " + String(pin) + " is not ADC-capable on ESP32");
+        printInfo("ADC pins: 32,33,34,35,36,39 (input-only) or 0,2,4,12-15,25-27");
+        return;
+    }
+    analogSetAttenuation(ADC_11db);  // Full 0-3.3V range
+    int raw = analogRead(pin);
+    float v = raw * 3.3f / 4095.0f;
+    char buf[48];
+    snprintf(buf, sizeof(buf), "ADC pin %d: raw=%d  voltage=%.3fV", pin, raw, v);
+    printData(String(buf));
+}
+
+void gpioPwm(int pin, uint32_t freq, uint8_t dutyPct) {
+    if(pin < 0 || pin > 39 || (pin >= 6 && pin <= 11)) {
+        printError("Invalid or unsafe pin for PWM");
+        return;
+    }
+    freq = constrain(freq, 1u, 40000000u);
+    dutyPct = constrain(dutyPct, (uint8_t)0, (uint8_t)100);
+    ledcSetup(0, freq, 8);            // channel 0, 8-bit resolution
+    ledcAttachPin(pin, 0);
+    uint32_t duty = (uint32_t)dutyPct * 255 / 100;
+    ledcWrite(0, duty);
+    printSuccess("PWM pin " + String(pin) + ": " + String(freq) + " Hz  duty=" + String(dutyPct) + "%");
+}
+
+void gpioFreq(int pin) {
+    if(pin < 0 || pin > 39) { printError("Invalid pin"); return; }
+    pinMode(pin, INPUT);
+    unsigned long hi = pulseIn(pin, HIGH, 1000000UL);
+    unsigned long lo = pulseIn(pin, LOW,  1000000UL);
+    if(hi == 0 || lo == 0) {
+        printWarning("No pulse detected on pin " + String(pin) + " within 1s");
+        return;
+    }
+    unsigned long period = hi + lo;
+    char buf[80];
+    snprintf(buf, sizeof(buf), "Pin %d: freq=%.1f Hz  period=%lu us  high=%lu us  low=%lu us",
+             pin, 1000000.0f / (float)period, period, hi, lo);
+    printData(String(buf));
+}
+
+void gpioPulse(int pin) {
+    if(pin < 0 || pin > 39) { printError("Invalid pin"); return; }
+    pinMode(pin, INPUT);
+    unsigned long w = pulseIn(pin, HIGH, 100000UL);
+    if(w == 0) {
+        printWarning("No HIGH pulse on pin " + String(pin) + " within 100 ms");
+        return;
+    }
+    printData("Pin " + String(pin) + ": pulse width = " + String(w) + " us");
+}
+
+void gpioScope(int pin, uint16_t samples, uint32_t intervalUs) {
+    if(pin < 0 || pin > 39) { printError("Invalid pin"); return; }
+    samples   = constrain(samples,   (uint16_t)1, (uint16_t)120);
+    intervalUs = max(intervalUs, (uint32_t)1);
+    pinMode(pin, INPUT);
+    printInfo("Sampling pin " + String(pin) + "  x" + String(samples) + " @ " + String(intervalUs) + " us");
+    String wave;
+    wave.reserve(samples + 1);
+    for(uint16_t i = 0; i < samples; i++) {
+        wave += digitalRead(pin) ? '-' : '_';
+        delayMicroseconds(intervalUs);
+    }
+    // Mark 10% boundaries for readability
+    String ruler;
+    ruler.reserve(samples + 1);
+    for(uint16_t i = 0; i < samples; i++) {
+        ruler += (i % (samples / 10 + 1) == 0) ? '|' : '.';
+    }
+    printData(wave);
+    printInfo(ruler);
+}
+
+// -------- NVS Config persistence --------
+void configSave() {
+    Preferences prefs;
+    prefs.begin("wiretap32", false);
+    prefs.putInt("disp_sda",  PIN_DISP_SDA);
+    prefs.putInt("disp_scl",  PIN_DISP_SCL);
+    prefs.putInt("i2c_sda",   PIN_I2C_SDA);
+    prefs.putInt("i2c_scl",   PIN_I2C_SCL);
+    prefs.putInt("spi_mosi",  PIN_SPI_MOSI);
+    prefs.putInt("spi_miso",  PIN_SPI_MISO);
+    prefs.putInt("spi_sck",   PIN_SPI_SCK);
+    prefs.putInt("spi_cs",    PIN_SPI_CS);
+    prefs.putInt("uart_tx",   PIN_UART_TX);
+    prefs.putInt("uart_rx",   PIN_UART_RX);
+    prefs.putUInt("uart_baud", UART_BAUD);
+    prefs.putUInt("i2c_freq",  I2C_FREQ);
+    prefs.putUInt("spi_freq",  SPI_FREQ);
+    prefs.putBool("colors",    useColors);
+    prefs.putBool("statusbar", showStatusBar);
+    prefs.end();
+    printSuccess("Config saved to flash (NVS)");
+}
+
+void configLoad() {
+    Preferences prefs;
+    prefs.begin("wiretap32", true);
+    if(!prefs.isKey("i2c_sda")) {
+        prefs.end();
+        printWarning("No saved config found — use 'config save' first");
+        return;
+    }
+    PIN_DISP_SDA  = prefs.getInt("disp_sda",   PIN_DISP_SDA);
+    PIN_DISP_SCL  = prefs.getInt("disp_scl",   PIN_DISP_SCL);
+    PIN_I2C_SDA   = prefs.getInt("i2c_sda",    PIN_I2C_SDA);
+    PIN_I2C_SCL   = prefs.getInt("i2c_scl",    PIN_I2C_SCL);
+    PIN_SPI_MOSI  = prefs.getInt("spi_mosi",   PIN_SPI_MOSI);
+    PIN_SPI_MISO  = prefs.getInt("spi_miso",   PIN_SPI_MISO);
+    PIN_SPI_SCK   = prefs.getInt("spi_sck",    PIN_SPI_SCK);
+    PIN_SPI_CS    = prefs.getInt("spi_cs",     PIN_SPI_CS);
+    PIN_UART_TX   = prefs.getInt("uart_tx",    PIN_UART_TX);
+    PIN_UART_RX   = prefs.getInt("uart_rx",    PIN_UART_RX);
+    UART_BAUD     = prefs.getUInt("uart_baud", UART_BAUD);
+    I2C_FREQ      = prefs.getUInt("i2c_freq",  I2C_FREQ);
+    SPI_FREQ      = prefs.getUInt("spi_freq",  SPI_FREQ);
+    useColors     = prefs.getBool("colors",    useColors);
+    showStatusBar = prefs.getBool("statusbar", showStatusBar);
+    prefs.end();
+    printSuccess("Config loaded from flash (NVS)");
+    showPins();
+}
+
+void configReset() {
+    Preferences prefs;
+    prefs.begin("wiretap32", false);
+    prefs.clear();
+    prefs.end();
+    printSuccess("Saved config cleared from flash");
+}
+
+// -------- Command history helpers --------
+void historyPush(const String& cmd) {
+    if(cmd.length() == 0) return;
+    if(cmdHistoryCount > 0) {
+        uint8_t lastIdx = (cmdHistoryHead + CMD_HISTORY_SIZE - 1) % CMD_HISTORY_SIZE;
+        if(cmdHistory[lastIdx] == cmd) return;  // skip duplicate of last entry
+    }
+    cmdHistory[cmdHistoryHead] = cmd;
+    cmdHistoryHead = (cmdHistoryHead + 1) % CMD_HISTORY_SIZE;
+    if(cmdHistoryCount < CMD_HISTORY_SIZE) cmdHistoryCount++;
+}
+
+String historyGet(int8_t age) {
+    if(age < 0 || age >= (int8_t)cmdHistoryCount) return "";
+    uint8_t idx = (cmdHistoryHead + CMD_HISTORY_SIZE - 1 - (uint8_t)age) % CMD_HISTORY_SIZE;
+    return cmdHistory[idx];
+}
+
 // -------- Parser helpers --------
 std::vector<String> tok(const String& s) {
     std::vector<String> v;
@@ -1976,17 +2190,31 @@ void help() {
     println("  ['Hello' r:64]    - UART macro syntax");
     println("");
     println("GPIO COMMANDS: (requires 'mode gpio' first)");
-    println("  gpio set <pin> <val> - Set output: 'gpio set 2 1' (HIGH)");
-    println("  gpio get <pin>    - Read input: 'gpio get 4'");
+    println("  gpio set <pin> <val>              - Set output HIGH/LOW: 'gpio set 2 1'");
+    println("  gpio get <pin>                    - Read digital input: 'gpio get 4'");
+    println("  gpio adc <pin>                    - Read analog voltage (ADC pins only)");
+    println("  gpio pwm <pin> <freq> <duty%>     - PWM output: 'gpio pwm 2 1000 50'");
+    println("  gpio freq <pin>                   - Measure signal frequency (1s window)");
+    println("  gpio pulse <pin>                  - Measure HIGH pulse width (us)");
+    println("  gpio scope <pin> [samples] [us]   - ASCII waveform capture");
     println("");
-    println("Note: Serial-only version (3.3V max, 12mA max per pin)");
+    println("CONFIG COMMANDS:");
+    println("  config save   - Persist pins/baud/colors to flash (NVS)");
+    println("  config load   - Restore saved config from flash");
+    println("  config reset  - Erase saved config from flash");
+    println("");
+    println("TIPS:");
+    println("  Backspace works  |  Up/Down arrows browse command history");
+    println("  <Enter> repeats last command  |  3.3V max, 12mA max per pin");
 }
 
 void showPins() {
     println("=== Pin Assignments ===");
-    println("I2C:  SDA=" + String(PIN_I2C_SDA) + "  SCL=" + String(PIN_I2C_SCL) + "  Freq=" + String(I2C_FREQ/1000) + "kHz  Pullups=" + String(I2C_PULLUPS ? "ON" : "OFF"));
+    println("DISP: SDA=" + String(PIN_DISP_SDA) + "  SCL=" + String(PIN_DISP_SCL) + "  (OLED Wire bus)");
+    println("I2C:  SDA=" + String(PIN_I2C_SDA)  + "  SCL=" + String(PIN_I2C_SCL)  + "  Freq=" + String(I2C_FREQ/1000) + "kHz  Pullups=" + String(I2C_PULLUPS ? "ON" : "OFF"));
     println("SPI:  MOSI=" + String(PIN_SPI_MOSI) + " MISO=" + String(PIN_SPI_MISO) + " SCK=" + String(PIN_SPI_SCK) + " CS=" + String(PIN_SPI_CS) + "  Freq=" + String(SPI_FREQ/1000) + "kHz");
     println("UART: RX=" + String(PIN_UART_RX) + "    TX=" + String(PIN_UART_TX) + "    Baud=" + String(UART_BAUD));
+    println("Use 'pins set <name> <pin>' — names: sda,scl,mosi,miso,sck,cs,tx,rx,disp-sda,disp-scl");
 }
 
 void showStatus() {
@@ -2123,9 +2351,11 @@ void handleCmd(const String& line) {
             else if(name=="cs") PIN_SPI_CS=p;
             else if(name=="tx") PIN_UART_TX=p;
             else if(name=="rx") PIN_UART_RX=p;
+            else if(name=="disp-sda") PIN_DISP_SDA=p;
+            else if(name=="disp-scl") PIN_DISP_SCL=p;
             else {
                 println("ERROR: Invalid pin name '" + v[2] + "'");
-                println("Valid pins: sda, scl, mosi, miso, sck, cs, tx, rx");
+                println("Valid pins: sda, scl, mosi, miso, sck, cs, tx, rx, disp-sda, disp-scl");
                 return;
             }
             println("Pin updated. Re-enter mode to apply.");
@@ -2452,11 +2682,46 @@ void handleCmd(const String& line) {
         }
         if(cmd=="get" && v.size()>=3) {
             int val=gpioGet(v[2].toInt());
-            if(val >= 0) {
-                println("Pin "+v[2]+" = "+String(val));
-            }
+            if(val >= 0) println("Pin "+v[2]+" = "+String(val));
             return;
         }
+        if(cmd=="adc" && v.size()>=3) {
+            gpioAdc(v[2].toInt());
+            return;
+        }
+        if(cmd=="pwm" && v.size()>=5) {
+            gpioPwm(v[2].toInt(), (uint32_t)v[3].toInt(), (uint8_t)constrain(v[4].toInt(),0,100));
+            return;
+        }
+        if(cmd=="freq" && v.size()>=3) {
+            gpioFreq(v[2].toInt());
+            return;
+        }
+        if(cmd=="pulse" && v.size()>=3) {
+            gpioPulse(v[2].toInt());
+            return;
+        }
+        if(cmd=="scope" && v.size()>=3) {
+            uint16_t samples   = (v.size()>=4) ? (uint16_t)v[3].toInt() : 64;
+            uint32_t intervalUs = (v.size()>=5) ? (uint32_t)v[4].toInt() : 100;
+            gpioScope(v[2].toInt(), samples, intervalUs);
+            return;
+        }
+        printError("Unknown gpio subcommand: " + cmd);
+        printInfo("gpio set|get|adc|pwm|freq|pulse|scope");
+        return;
+    }
+
+    if(c=="config") {
+        if(v.size()>=2) {
+            String sub = v[1];
+            sub.toLowerCase();
+            if(sub=="save")  { configSave();  return; }
+            if(sub=="load")  { configLoad();  return; }
+            if(sub=="reset") { configReset(); return; }
+        }
+        println("Usage: config save|load|reset");
+        return;
     }
 
     println("Unknown command: '" + c + "'");
@@ -2472,17 +2737,55 @@ void handleCmd(const String& line) {
 }
 
 void handleInputStream(Stream& s) {
+    static uint8_t escState = 0;  // 0=normal, 1=got ESC, 2=got ESC[
+
     while(s.available()) {
-        char ch=s.read();
-        if(ch=='\r') continue;
-        if(ch=='\n') {
-            String cmd=inbuf;
-            inbuf="";
+        char ch = s.read();
+
+        // ---- ANSI escape sequence handling ----
+        if(escState == 1) {
+            escState = (ch == '[') ? 2 : 0;
+            continue;
+        }
+        if(escState == 2) {
+            escState = 0;
+            auto replaceInput = [&](const String& newBuf) {
+                // Erase current input with backspaces then print new buf
+                for(size_t i = 0; i < inbuf.length(); i++) { USB.print('\b'); USB.print(' '); USB.print('\b'); }
+                inbuf = newBuf;
+                USB.print(inbuf);
+            };
+            if(ch == 'A') {  // Up arrow — older history
+                if(cmdHistoryPos < (int8_t)cmdHistoryCount - 1) cmdHistoryPos++;
+                String h = historyGet(cmdHistoryPos);
+                if(h.length() > 0) replaceInput(h);
+            } else if(ch == 'B') {  // Down arrow — newer history
+                cmdHistoryPos--;
+                replaceInput(cmdHistoryPos >= 0 ? historyGet(cmdHistoryPos) : "");
+            }
+            continue;
+        }
+        if(ch == 27) { escState = 1; continue; }  // ESC
+
+        // ---- Normal character handling ----
+        if(ch == '\r') continue;
+
+        if(ch == '\n') {
+            String cmd = inbuf;
+            inbuf = "";
+            cmdHistoryPos = -1;
+            USB.print('\n');
             if(cmd.length() > 0) {
+                historyPush(cmd);
                 handleCmd(cmd);
             }
             prompt();
-        } else if (inbuf.length() < 256) { // Limit input buffer
+        } else if(ch == 127 || ch == '\b') {  // Backspace / DEL
+            if(inbuf.length() > 0) {
+                inbuf.remove(inbuf.length() - 1);
+                USB.print('\b'); USB.print(' '); USB.print('\b');
+            }
+        } else if(inbuf.length() < 256) {
             inbuf += ch;
         }
         safeYield();
@@ -2495,7 +2798,7 @@ void handleInputStream(Stream& s) {
 void setup() {
     // Disable watchdog during setup (commented out to avoid WDT errors)
     // disableCore0WDT();
-    Wire.begin(5, 4);
+    Wire.begin(PIN_DISP_SDA, PIN_DISP_SCL);
     USB.begin(115200);
     delay(2000); // Longer delay for stability
     
