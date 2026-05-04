@@ -1,8 +1,8 @@
-# WireTap-32 - ESP32 Mini Bus Pirate
+# WireTap-32 - ESP32 Bench Companion
 
-A feature-rich, single-file ESP32 implementation of the classic Bus Pirate protocol analyzer. This version provides a stable serial interface with a simple OLED GPIO browser and status view driven by three physical buttons.
+A feature-rich ESP32 implementation of a mini Bus Pirate-style electronics bench tool. WireTap-32 stays serial-first and dev-board friendly, with protocol tools, GPIO controls, simple signal analysis, and an optional OLED GPIO browser driven by three physical buttons.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-yellow.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Arduino](https://img.shields.io/badge/Arduino-Compatible-green.svg)](https://www.arduino.cc/)
 [![ESP32](https://img.shields.io/badge/ESP32-Compatible-blue.svg)](https://www.espressif.com/en/products/socs/esp32)
 
@@ -21,10 +21,11 @@ A feature-rich, single-file ESP32 implementation of the classic Bus Pirate proto
 ## Features
 
 ### 🔧 Protocol Support
-- **I2C**: Scanning, read/write operations with progress indicators
-- **SPI**: Full-duplex transfers with configurable parameters
-- **UART**: Bidirectional communication with buffering
-- **GPIO**: Digital I/O control and monitoring
+- **I2C**: Scan, ping, identify, register read/write, dump, monitor, EEPROM shell, recovery, slave/logger mode
+- **SPI**: Full-duplex transfers, configurable mode/order/frequency, SPI EEPROM shell, SPI flash ID/read helper
+- **UART**: TX/RX, auto-baud scan, bridge mode, AT helper, periodic spam mode
+- **GPIO**: Digital I/O, ADC, PWM, pulse/frequency checks, ASCII waveform capture
+- **Signal Tools**: Frequency/duty estimates, edge counting, ADC stats, PWM test output
 
 ### 📟 Display Features
 - **SSD1306 OLED Support**: Real-time status display (128x64, 0.96")
@@ -36,6 +37,7 @@ A feature-rich, single-file ESP32 implementation of the classic Bus Pirate proto
 - **Memory Management**: Fixed buffers prevent heap fragmentation
 - **Error Recovery**: Robust error handling and safe pin states
 - **Serial Only**: Eliminates WiFi complexity for maximum reliability
+- **Pin Audit**: `pins check` reports unsafe GPIOs, input-only pins, strapping pins, and common conflicts
 
 ### 🖲️ Local Controls
 - **3-Button OLED Menu**: Navigate a GPIO browser and status screen with the board buttons
@@ -71,6 +73,18 @@ Connect your target devices to the configurable GPIO pins (defaults shown):
 | Display | SDA, SCL | 5, 4 |
 | Buttons | LEFT, CENTER, RIGHT | 34, 36, 39 |
 
+### Bare ESP32 Limits
+
+WireTap-32 is designed for a plain ESP32 dev board. That keeps it easy to build, but it also means:
+
+- ESP32 GPIO is **3.3V only**. Do not connect 5V signals directly.
+- There is no onboard input protection, level shifting, current limiting, or resettable fuse.
+- The signal tools are simple GPIO/ADC samplers, not an oscilloscope or high-speed logic analyzer.
+- Passive I2C/SPI sniffing is not supported on this bare-board build.
+- GPIO 6-11 are tied to onboard flash, GPIO 34-39 are input-only, and strap pins can affect boot.
+
+Run `pins check` before wiring an unfamiliar target. The default OLED SDA pin (`GPIO5`) also overlaps the default SPI CS pin, so move SPI CS with `pins set cs <pin>` when using the OLED and SPI together.
+
 ## Quick Start
 
 ### 1. Install Libraries
@@ -93,6 +107,12 @@ ESP32 → SSD1306 Display (optional)
 3. Select your COM port
 4. Click Upload
 
+Arduino CLI users can compile with:
+
+```bash
+arduino-cli compile --fqbn esp32:esp32:esp32 WireTap-32.ino
+```
+
 ### 4. Connect and Use
 1. Open Serial Monitor at **115200 baud**
 2. Type `help` to see all available commands
@@ -107,6 +127,7 @@ help                    # Show complete command list
 status                  # System information
 mode i2c|spi|uart|gpio|hiz  # Set operating mode
 pins                    # Show pin assignments
+pins check              # Audit unsafe pins and conflicts
 pins set sda 25         # Change pin assignments
 display on|off          # Control OLED display
 ```
@@ -115,8 +136,13 @@ display on|off          # Control OLED display
 ```bash
 mode i2c                # Enter I2C mode
 i2c scan                # Scan for devices (0x01-0x7F)
-i2c r 0x50 8           # Read 8 bytes from address 0x50
-i2c w 0x50 0x00 0xFF   # Write bytes to address 0x50
+i2c ping 0x50           # Probe an address for ACK
+i2c identify 0x76       # Guess common device families
+i2c read 0x50 0x00 8    # Read 8 bytes from register 0x00
+i2c write 0x50 0x00 0xFF # Write bytes to a register
+i2c dump 0x50 64        # Dump sequential bytes
+i2c monitor 0x50 0 4 500 # Watch register changes
+i2c recover             # Try to free a stuck I2C bus
 pullups on|off          # Control internal pullups
 freq i2c 100000         # Set I2C frequency (Hz)
 ```
@@ -125,6 +151,8 @@ freq i2c 100000         # Set I2C frequency (Hz)
 ```bash
 mode spi                # Enter SPI mode
 spi x 0x90 0x00        # Transfer bytes (send 0x90, 0x00)
+spi flash               # Read SPI flash JEDEC ID / bytes
+spi eeprom              # 25xx EEPROM helper shell
 freq spi 1000000        # Set SPI frequency (Hz)
 ```
 
@@ -135,6 +163,9 @@ uart baud 9600          # Set baud rate
 uart tx "Hello"         # Send string
 uart tx 0x41 0x42      # Send hex bytes
 uart rx 10              # Read up to 10 bytes
+uart scan               # Detect common baud rates with traffic
+uart bridge             # USB-to-target serial bridge
+uart at                 # AT command helper
 ```
 
 ### GPIO Commands
@@ -143,6 +174,17 @@ mode gpio               # Enter GPIO mode
 gpio set 2 1           # Set pin 2 HIGH
 gpio get 4             # Read pin 4 state
 ```
+
+### Signal Analyzer Commands
+```bash
+signal pwmout 25 1000 50 # Generate 1kHz 50% PWM on GPIO25
+signal freq 26 1000      # Measure frequency/duty for 1 second on GPIO26
+signal edges 26 500      # Count rising/falling edges for 500ms
+signal scope 26 80 100   # Capture 80 digital samples, 100us apart
+signal adc 34 64         # ADC min/avg/max over 64 samples
+```
+
+For a quick loopback demo, jumper GPIO25 to GPIO26, run `signal pwmout 25 1000 50`, then run `signal freq 26 1000`.
 
 ## Display Information
 
@@ -159,7 +201,8 @@ The display updates every 500ms and can be toggled with `display on/off` command
 ## Technical Details
 
 ### Architecture
-- **Single File**: Complete implementation in one Arduino sketch
+- **Arduino Sketch Entrypoint**: `WireTap-32.ino` owns setup, loop, parser, and protocol handlers
+- **Small Modules**: `src/SignalTools.*` and `src/PinSafety.*` keep measurement and safety logic separate
 - **State Machine**: Clean mode switching with proper cleanup
 - **Buffer Management**: Circular buffers for UART with overflow protection
 - **Safe Operations**: Timeout handling and resource cleanup
@@ -205,16 +248,15 @@ No response from device
 
 ## Development
 
-This project uses Arduino IDE's build system. No external build tools required.
+This project uses the Arduino build system and works from Arduino IDE or `arduino-cli`.
 
 ### Code Organization
 ```
-ESP32_BusPirate_Stable.ino    # Main source file
-├── Protocol Handlers         # I2C, SPI, UART, GPIO functions
-├── Command Parser            # Text command processing
-├── Display System            # SSD1306 OLED support
-├── Utility Functions         # Hex parsing, string handling
-└── Stability Framework       # Yield management, error handling
+WireTap-32.ino          # Main sketch, parser, protocol handlers, OLED UI
+src/SignalTools.*       # Signal measurement, ADC stats, PWM output
+src/PinSafety.*         # Pin audit and conflict reporting
+README.md / USAGE.md    # User-facing docs
+DEMOS.md                # Hands-on test ideas
 ```
 
 ### Contributing

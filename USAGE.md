@@ -237,14 +237,27 @@ spi x 0x02 0x00 0x00 0xAA 0xBB  # Write 0xAA, 0xBB to 0x0000
 
 ## Advanced Tips
 
-### Using Logic Analyzer Mode
-Set up multiple pins and use `gpio get` to sample signals:
+### Using Signal Analyzer Commands
+Use the `signal` commands for simple ESP32-speed line checks. These are useful for PWM, button edges, servo pulses, slow clocks, and basic “is this line alive?” debugging. They are not a replacement for a protected oscilloscope or high-speed logic analyzer.
+
+Generate a test signal on one pin and measure it on another:
 ```
-mode gpio
-gpio get 2    # Sample pin 2
-gpio get 4    # Sample pin 4
-gpio get 5    # Sample pin 5
+signal pwmout 25 1000 50
+signal freq 26 1000
 ```
+
+Count transitions or capture a small ASCII waveform:
+```
+signal edges 26 500
+signal scope 26 80 100
+```
+
+For voltage checks, only use ADC-capable pins and keep the input under 3.3V:
+```
+signal adc 34 64
+```
+
+Run `pins check` before wiring unfamiliar targets. It flags GPIO 6-11, input-only pins, strap pins, and display/protocol conflicts.
 
 ### Bit-banging Custom Protocols
 Use GPIO mode to manually control timing:

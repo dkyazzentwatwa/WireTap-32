@@ -1,12 +1,12 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-The firmware lives entirely in `ESP32_BusPirate_Stable.ino`. Inside the sketch you will find grouped sections for CLI I/O, protocol handlers, display support, and utility helpers—keep related additions with the existing banner comments. Reference photos stay in `img/`, while user-facing docs reside in `README.md` and `USAGE.md`; sync any interface changes across these files. If you introduce auxiliary scripts (e.g., build helpers), place them in a new `tools/` directory and document their usage here.
+The firmware entrypoint is `WireTap-32.ino`. Keep setup/loop, command routing, protocol handlers, display support, and utility helpers with the existing banner comments. Small reusable helpers may live in `src/`, such as `SignalTools.*` and `PinSafety.*`. Reference photos stay in `img/`, while user-facing docs reside in `README.md`, `USAGE.md`, and `DEMOS.md`; sync any interface changes across these files. If you introduce auxiliary scripts (e.g., build helpers), place them in a new `tools/` directory and document their usage here.
 
 ## Build, Test, and Development Commands
 - `arduino-cli core install esp32:esp32` — install the ESP32 board support package before first compile.
-- `arduino-cli compile --fqbn esp32:esp32:esp32 ESP32_BusPirate_Stable.ino` — verify the sketch for a generic ESP32 DevKit target.
-- `arduino-cli upload --port /dev/ttyUSB0 --fqbn esp32:esp32:esp32 ESP32_BusPirate_Stable.ino` — flash the board (adjust port and FQBN to match your hardware).
+- `arduino-cli compile --fqbn esp32:esp32:esp32 WireTap-32.ino` — verify the sketch for a generic ESP32 DevKit target.
+- `arduino-cli upload --port /dev/ttyUSB0 --fqbn esp32:esp32:esp32 WireTap-32.ino` — flash the board (adjust port and FQBN to match your hardware).
 Capture compile/upload logs and attach the relevant excerpt to your pull request.
 
 ## Coding Style & Naming Conventions

@@ -420,13 +420,13 @@ Reading raw card responses lets you verify the card is alive and responding befo
 
 ### 24. Measure your own power supply voltage
 
-Use `gpio adc` on any ADC pin to measure a voltage divider. To measure 5V safely with two 10kΩ resistors in series (5V→R1→pin→R2→GND):
+Use `signal adc` on any ADC pin to measure a voltage divider. To measure 5V safely with two 10kΩ resistors in series (5V→R1→pin→R2→GND):
 
 ```
-gpio adc 34
+signal adc 34 64
 ```
 
-Output: `ADC pin 34: raw=2482  voltage=2.001V`. Since you divided by 2, actual voltage = 2.001 × 2 = 4.0V. Calibrate the divider ratio for your actual resistor values.
+Output includes min/avg/max raw ADC and voltage estimates. Since you divided by 2, multiply the reported voltage by 2. Calibrate the divider ratio for your actual resistor values.
 
 ---
 
@@ -436,7 +436,7 @@ Connect the servo signal wire (usually orange/yellow) to any input pin:
 
 ```
 gpio pulse 34     -- measure the HIGH pulse width (should be 1000–2000 us for servos)
-gpio freq 34      -- measure frequency (should be ~50 Hz for standard servos)
+signal freq 34    -- measure frequency/duty (should be ~50 Hz for standard servos)
 ```
 
 Standard servo neutral = ~1500 µs. Full range = 1000–2000 µs. This instantly tells you whether a servo controller is sending correct signals without an oscilloscope.
@@ -446,7 +446,7 @@ Standard servo neutral = ~1500 µs. Full range = 1000–2000 µs. This instantly
 ### 26. Capture a button press or IR signal
 
 ```
-gpio scope 34 80 1000    -- 80 samples, 1ms apart (80ms total window)
+signal scope 34 80 1000    -- 80 samples, 1ms apart (80ms total window)
 ```
 
 Press a button or trigger an IR remote while scope is sampling. The output:
@@ -456,6 +456,22 @@ ____----____----____----____----____----____----____----____---
 ```
 
 Shows you the timing pattern of the signal. Run a few times to catch the event.
+
+---
+
+### 27. PWM loopback self-test
+
+Jumper GPIO25 to GPIO26, generate a PWM signal, and measure it:
+
+```
+pins check
+signal pwmout 25 1000 50
+signal freq 26 1000
+signal edges 26 500
+signal scope 26 80 100
+```
+
+This confirms the signal generator and simple analyzer path without external gear. Keep the jumper short and stay on 3.3V GPIO.
 
 ---
 

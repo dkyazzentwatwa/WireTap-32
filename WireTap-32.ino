@@ -13,6 +13,8 @@
 #include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include "src/SignalTools.h"
+#include "src/PinSafety.h"
 
 // WiFi AP variables removed for serial-only version
 
@@ -187,6 +189,12 @@ void gpioPwm(int pin, uint32_t freq, uint8_t dutyPct);
 void gpioFreq(int pin);
 void gpioPulse(int pin);
 void gpioScope(int pin, uint16_t samples, uint32_t intervalUs);
+void pinsCheck();
+void signalFreqCmd(int pin, uint32_t windowMs);
+void signalEdgesCmd(int pin, uint32_t windowMs);
+void signalScopeCmd(int pin, uint16_t samples, uint32_t intervalUs);
+void signalAdcCmd(int pin, uint16_t samples);
+void signalPwmOutCmd(int pin, uint32_t freq, uint8_t dutyPct);
 void configSave();
 void configLoad();
 void configReset();
@@ -272,7 +280,7 @@ void printHeader(const String& s) {
     else _out_raw(s + "\n");
 }
 
-const char* getModeName(Mode m) {
+const char* getModeName(uint8_t m) {
     switch(m) {
         case HIZ: return "Hi-Z";
         case GPIO_MODE: return "GPIO";
@@ -1363,6 +1371,7 @@ void spiExecuteMacro(const String& command) {
 void spiEepromShell() {
     printHeader("SPI EEPROM shell (25xx)");
     println("Commands: read <addr> <len>, write <addr> <hex..>, status, exit");
+    printWarning("Write commands modify the target chip. Start with read/status when probing unknown parts.");
     while(true) {
         String line;
         if(!readLineBlocking("spi-eeprom> ", line)) break;
@@ -1433,6 +1442,7 @@ void spiEepromShell() {
 void spiFlashShell() {
     printHeader("SPI flash shell");
     println("Commands: id, read <addr> <len>, status, exit");
+    printWarning("Read-only helper: identify and dump before making changes with external tools.");
     while(true) {
         String line;
         if(!readLineBlocking("spi-flash> ", line)) break;
@@ -1485,15 +1495,18 @@ void spiFlashShell() {
 }
 
 void spiSniff() {
-    printWarning("SPI sniffing not supported on this build (requires logic analyzer hardware)");
+    printWarning("SPI sniff is not supported on a bare ESP32 dev board.");
+    printInfo("Use 'signal scope' or 'signal edges' for simple line checks, or an external logic analyzer for passive SPI decode.");
 }
 
 void spiSlaveMonitor() {
-    printWarning("SPI slave monitor not implemented");
+    printWarning("SPI slave monitor is not supported on this bare ESP32 build.");
+    printInfo("WireTap-32 can actively transfer with 'spi x', but passive multi-line SPI capture needs dedicated analyzer hardware.");
 }
 
 void spiSdcardShell() {
-    printWarning("SD card helper not implemented");
+    printWarning("SPI SD card helper is not implemented for the dev-board-only build.");
+    printInfo("Use 'spi x' for manual transfers or 'spi flash'/'spi eeprom' for supported chip helpers.");
 }
 
 // -------- UART --------
@@ -1874,50 +1887,15 @@ int gpioGet(int pin) {
 
 // -------- GPIO extended --------
 void gpioAdc(int pin) {
-    static const int adcOk[] = {32, 33, 34, 35, 36, 39, 25, 26, 27, 14, 12, 13, 4, 2, 15, 0, -1};
-    bool valid = false;
-    for(int i = 0; adcOk[i] != -1; i++) { if(pin == adcOk[i]) { valid = true; break; } }
-    if(!valid) {
-        printError("Pin " + String(pin) + " is not ADC-capable on ESP32");
-        printInfo("ADC pins: 32,33,34,35,36,39 (input-only) or 0,2,4,12-15,25-27");
-        return;
-    }
-    analogSetAttenuation(ADC_11db);  // Full 0-3.3V range
-    int raw = analogRead(pin);
-    float v = raw * 3.3f / 4095.0f;
-    char buf[48];
-    snprintf(buf, sizeof(buf), "ADC pin %d: raw=%d  voltage=%.3fV", pin, raw, v);
-    printData(String(buf));
+    signalAdcCmd(pin, 1);
 }
 
 void gpioPwm(int pin, uint32_t freq, uint8_t dutyPct) {
-    if(pin < 0 || pin > 39 || (pin >= 6 && pin <= 11)) {
-        printError("Invalid or unsafe pin for PWM");
-        return;
-    }
-    freq = constrain(freq, 1u, 40000000u);
-    dutyPct = constrain(dutyPct, (uint8_t)0, (uint8_t)100);
-    ledcSetup(0, freq, 8);            // channel 0, 8-bit resolution
-    ledcAttachPin(pin, 0);
-    uint32_t duty = (uint32_t)dutyPct * 255 / 100;
-    ledcWrite(0, duty);
-    printSuccess("PWM pin " + String(pin) + ": " + String(freq) + " Hz  duty=" + String(dutyPct) + "%");
+    signalPwmOutCmd(pin, freq, dutyPct);
 }
 
 void gpioFreq(int pin) {
-    if(pin < 0 || pin > 39) { printError("Invalid pin"); return; }
-    pinMode(pin, INPUT);
-    unsigned long hi = pulseIn(pin, HIGH, 1000000UL);
-    unsigned long lo = pulseIn(pin, LOW,  1000000UL);
-    if(hi == 0 || lo == 0) {
-        printWarning("No pulse detected on pin " + String(pin) + " within 1s");
-        return;
-    }
-    unsigned long period = hi + lo;
-    char buf[80];
-    snprintf(buf, sizeof(buf), "Pin %d: freq=%.1f Hz  period=%lu us  high=%lu us  low=%lu us",
-             pin, 1000000.0f / (float)period, period, hi, lo);
-    printData(String(buf));
+    signalFreqCmd(pin, 1000);
 }
 
 void gpioPulse(int pin) {
@@ -1932,25 +1910,7 @@ void gpioPulse(int pin) {
 }
 
 void gpioScope(int pin, uint16_t samples, uint32_t intervalUs) {
-    if(pin < 0 || pin > 39) { printError("Invalid pin"); return; }
-    samples   = constrain(samples,   (uint16_t)1, (uint16_t)120);
-    intervalUs = max(intervalUs, (uint32_t)1);
-    pinMode(pin, INPUT);
-    printInfo("Sampling pin " + String(pin) + "  x" + String(samples) + " @ " + String(intervalUs) + " us");
-    String wave;
-    wave.reserve(samples + 1);
-    for(uint16_t i = 0; i < samples; i++) {
-        wave += digitalRead(pin) ? '-' : '_';
-        delayMicroseconds(intervalUs);
-    }
-    // Mark 10% boundaries for readability
-    String ruler;
-    ruler.reserve(samples + 1);
-    for(uint16_t i = 0; i < samples; i++) {
-        ruler += (i % (samples / 10 + 1) == 0) ? '|' : '.';
-    }
-    printData(wave);
-    printInfo(ruler);
+    signalScopeCmd(pin, samples, intervalUs);
 }
 
 // -------- NVS Config persistence --------
@@ -2153,6 +2113,7 @@ void help() {
     println("  help, h, ?        - Show this help");
     println("  status, stat, s   - Show system status");
     println("  pins, p           - Show pin assignments");
+    println("  pins check        - Audit unsafe pins, input-only pins, and conflicts");
     println("  pins set <name> <pin> - Set pin (sda,scl,mosi,miso,sck,cs,tx,rx)");
     println("  colors [on|off]   - Toggle/set color output");
     println("  statusbar [on|off] - Toggle/set status bar");
@@ -2181,6 +2142,13 @@ void help() {
     println("  spi sniff|slave|sdcard|eeprom|flash - Mode helpers");
     println("  spi config freq|mode|order|pins ...");
     println("  [0x9F r:3]        - SPI macro (JEDEC ID example)");
+    println("");
+    println("SIGNAL COMMANDS: (3.3V only, simple ESP32 sampler)");
+    println("  signal freq <pin> [ms]          - Frequency/duty estimate");
+    println("  signal edges <pin> [ms]         - Count rising/falling edges");
+    println("  signal scope <pin> [samples] [us] - ASCII waveform capture");
+    println("  signal adc <pin> [samples]      - ADC min/avg/max voltage");
+    println("  signal pwmout <pin> <hz> <duty%> - Generate PWM test signal");
     println("");
     println("UART COMMANDS: (requires 'mode uart' first)");
     println("  uart baud|scan|ping|read|write|bridge|spam|at");
@@ -2225,6 +2193,119 @@ void showStatus() {
     println("Free Heap:   " + String(ESP.getFreeHeap()/1024) + "KB (" + String(ESP.getFreeHeap()) + " bytes)");
     println("UART Buffer: " + String(uart_avail()) + "/" + String(UART_BUF_SZ) + " bytes" + (uart_avail() > 0 ? " [DATA WAITING]" : ""));
     println("Uptime:      " + String(millis()/1000) + " seconds");
+}
+
+void pinsCheck() {
+    WireTapPinConfig cfg = {
+        PIN_DISP_SDA,
+        PIN_DISP_SCL,
+        PIN_I2C_SDA,
+        PIN_I2C_SCL,
+        PIN_SPI_MOSI,
+        PIN_SPI_MISO,
+        PIN_SPI_SCK,
+        PIN_SPI_CS,
+        PIN_UART_TX,
+        PIN_UART_RX,
+        getModeName(mode)
+    };
+    print(buildPinSafetyReport(cfg));
+}
+
+void signalFreqCmd(int pin, uint32_t windowMs) {
+    if(!signalIsSafeDigitalPin(pin)) {
+        printError("Invalid or unsafe GPIO for signal measurement");
+        printInfo("Avoid GPIO 6-11. Use 3.3V logic only.");
+        return;
+    }
+    SignalFrequencyResult result = signalMeasureFrequency(pin, windowMs);
+    if(!result.valid) {
+        printError("Signal frequency measurement failed");
+        return;
+    }
+    char buf[128];
+    snprintf(buf, sizeof(buf), "GPIO%d freq=%.2fHz duty=%.1f%% edges R:%lu F:%lu avg HIGH:%luus LOW:%luus window:%lums",
+             pin,
+             result.frequencyHz,
+             result.dutyPct,
+             (unsigned long)result.risingEdges,
+             (unsigned long)result.fallingEdges,
+             (unsigned long)result.avgHighUs,
+             (unsigned long)result.avgLowUs,
+             (unsigned long)(result.durationUs / 1000));
+    printData(String(buf));
+    if(result.risingEdges == 0 && result.fallingEdges == 0) {
+        printWarning("No edges detected; signal may be stuck or outside this simple sampler's range.");
+    }
+}
+
+void signalEdgesCmd(int pin, uint32_t windowMs) {
+    if(!signalIsSafeDigitalPin(pin)) {
+        printError("Invalid or unsafe GPIO for edge count");
+        return;
+    }
+    SignalEdgeResult result = signalCountEdges(pin, windowMs);
+    if(!result.valid) {
+        printError("Signal edge count failed");
+        return;
+    }
+    char buf[104];
+    snprintf(buf, sizeof(buf), "GPIO%d edges R:%lu F:%lu start:%s end:%s window:%lums",
+             pin,
+             (unsigned long)result.risingEdges,
+             (unsigned long)result.fallingEdges,
+             result.startedHigh ? "HIGH" : "LOW",
+             result.endedHigh ? "HIGH" : "LOW",
+             (unsigned long)(result.durationUs / 1000));
+    printData(String(buf));
+    if(result.risingEdges == 0 && result.fallingEdges == 0) {
+        printWarning("No transitions detected.");
+    }
+}
+
+void signalScopeCmd(int pin, uint16_t samples, uint32_t intervalUs) {
+    String wave;
+    String ruler;
+    if(!signalBuildScope(pin, samples, intervalUs, wave, ruler)) {
+        printError("Invalid or unsafe GPIO for scope capture");
+        return;
+    }
+    printInfo("Sampling GPIO" + String(pin) + " x" + String(samples) + " @ " + String(intervalUs) + "us");
+    printData(wave);
+    printInfo(ruler);
+}
+
+void signalAdcCmd(int pin, uint16_t samples) {
+    if(!signalIsAdcCapablePin(pin)) {
+        printError("GPIO" + String(pin) + " is not ADC-capable on ESP32");
+        printInfo("ADC pins: 32,33,34,35,36,39 (input-only) or 0,2,4,12-15,25-27");
+        return;
+    }
+    SignalAdcStats result = signalMeasureAdc(pin, samples);
+    if(!result.valid) {
+        printError("ADC read failed");
+        return;
+    }
+    char buf[144];
+    snprintf(buf, sizeof(buf), "GPIO%d ADC samples=%u raw min/avg/max=%d/%.1f/%d voltage min/avg/max=%.3f/%.3f/%.3fV",
+             pin,
+             result.samples,
+             result.minRaw,
+             result.avgRaw,
+             result.maxRaw,
+             result.minVoltage,
+             result.avgVoltage,
+             result.maxVoltage);
+    printData(String(buf));
+}
+
+void signalPwmOutCmd(int pin, uint32_t freq, uint8_t dutyPct) {
+    String error;
+    if(!signalStartPwm(pin, freq, dutyPct, error)) {
+        printError("PWM output failed: " + error);
+        return;
+    }
+    printSuccess("PWM GPIO" + String(pin) + ": " + String(freq) + "Hz duty=" + String(dutyPct) + "%");
 }
 
 void handleCmd(const String& line) {
@@ -2339,6 +2420,7 @@ void handleCmd(const String& line) {
     
     if(c=="pins"||c=="p") {
         if(v.size()==1) { showPins(); return; }
+        if(v.size()==2 && v[1]=="check") { pinsCheck(); return; }
         if(v.size()==4 && (v[1]=="set"||v[1]=="s")) {
             int p=v[3].toInt();
             String name = v[2];
@@ -2673,6 +2755,39 @@ void handleCmd(const String& line) {
         }
     }
 
+    if(c=="signal" && v.size()>=2) {
+        String cmd = v[1];
+        cmd.toLowerCase();
+        if(cmd=="freq" && v.size()>=3) {
+            uint32_t windowMs = (v.size()>=4) ? (uint32_t)strtoul(v[3].c_str(), nullptr, 0) : 1000;
+            signalFreqCmd(v[2].toInt(), windowMs);
+            return;
+        }
+        if(cmd=="edges" && v.size()>=3) {
+            uint32_t windowMs = (v.size()>=4) ? (uint32_t)strtoul(v[3].c_str(), nullptr, 0) : 1000;
+            signalEdgesCmd(v[2].toInt(), windowMs);
+            return;
+        }
+        if(cmd=="scope" && v.size()>=3) {
+            uint16_t samples = (v.size()>=4) ? (uint16_t)v[3].toInt() : 64;
+            uint32_t intervalUs = (v.size()>=5) ? (uint32_t)v[4].toInt() : 100;
+            signalScopeCmd(v[2].toInt(), samples, intervalUs);
+            return;
+        }
+        if(cmd=="adc" && v.size()>=3) {
+            uint16_t samples = (v.size()>=4) ? (uint16_t)v[3].toInt() : 32;
+            signalAdcCmd(v[2].toInt(), samples);
+            return;
+        }
+        if(cmd=="pwmout" && v.size()>=5) {
+            signalPwmOutCmd(v[2].toInt(), (uint32_t)strtoul(v[3].c_str(), nullptr, 0), (uint8_t)constrain(v[4].toInt(),0,100));
+            return;
+        }
+        printError("Unknown signal subcommand: " + cmd);
+        printInfo("signal freq|edges|scope|adc|pwmout");
+        return;
+    }
+
     if(c=="gpio" && v.size()>=2) {
         String cmd = v[1];
         cmd.toLowerCase();
@@ -2732,6 +2847,7 @@ void handleCmd(const String& line) {
     else if(c.startsWith("sp")) println("Did you mean: spi x <hex> ?");
     else if(c.startsWith("ua")) println("Did you mean: uart tx|rx|baud ?");
     else if(c.startsWith("gp")) println("Did you mean: gpio set|get ?");
+    else if(c.startsWith("si")) println("Did you mean: signal freq|edges|scope|adc|pwmout ?");
     else if(c.startsWith("mo")) println("Did you mean: mode hiz|gpio|i2c|spi|uart ?");
     else if(c.startsWith("pi")) println("Did you mean: pins [set <name> <pin>] ?");
 }

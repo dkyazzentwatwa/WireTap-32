@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is an ESP32-based Bus Pirate implementation - a single-file Arduino sketch that creates a "mini Bus Pirate" with a serial terminal interface and optional OLED display. It provides protocol analysis capabilities for I2C, SPI, UART, and GPIO operations.
+This is an ESP32-based Bus Pirate-style bench tool with a serial terminal interface, optional OLED display, and small Arduino-friendly helper modules. It provides protocol analysis capabilities for I2C, SPI, UART, GPIO, and simple signal measurement.
 
 **Current Version**: Serial-only with SSD1306 OLED display support (WiFi/web interface removed for stability)
 
@@ -12,19 +12,21 @@ This is an ESP32-based Bus Pirate implementation - a single-file Arduino sketch 
 
 ### Arduino IDE Setup
 - **Board**: ESP32 Dev Module (use Arduino IDE board manager)
-- **Compilation**: Open `ESP32_BusPirate_Stable.ino` in Arduino IDE and compile/upload directly
+- **Compilation**: Open `WireTap-32.ino` in Arduino IDE and compile/upload directly
+- **CLI compile**: `arduino-cli compile --fqbn esp32:esp32:esp32 WireTap-32.ino`
 - **Library Dependencies**:
   - Arduino ESP32 core libraries
   - Adafruit GFX Library
   - Adafruit SSD1306 Library
 
 ### No Traditional Build System
-This project uses the Arduino IDE's build system. There are no separate build scripts, package managers, or configuration files.
+This project uses the Arduino build system. There are no separate build scripts, package managers, or configuration files.
 
 ## Architecture
 
 ### Core Components
 - **Protocol Handlers**: Separate functions for I2C (`i2cBegin()`, `i2cScan()`, etc.), SPI (`spiBegin()`, `spiXfer()`), UART (`uartBegin()`, `uartTx()`), and GPIO operations
+- **Signal/Pin Modules**: `src/SignalTools.*` handles simple measurement/PWM helpers; `src/PinSafety.*` builds the `pins check` report
 - **Advanced Protocol Features**:
   - **I2C Monitoring**: Real-time monitoring of I2C register values with change detection
   - **I2C Slave Mode**: ESP32 can act as I2C slave device with configurable address and responses
