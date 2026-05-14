@@ -1,19 +1,49 @@
 #include "SignalTools.h"
 
 bool signalIsValidGpio(int pin) {
+#if WIRETAP_CARDPUTER_ADV
+    switch(pin) {
+        case 4:
+        case 5:
+        case 6:
+        case 8:
+        case 9:
+        case 13:
+        case 14:
+        case 15:
+        case 39:
+        case 40:
+            return true;
+        default:
+            return false;
+    }
+#else
     return pin >= 0 && pin <= 39;
+#endif
 }
 
 bool signalIsSafeDigitalPin(int pin) {
+#if WIRETAP_CARDPUTER_ADV
+    return signalIsValidGpio(pin);
+#else
     return signalIsValidGpio(pin) && !(pin >= 6 && pin <= 11);
+#endif
 }
 
 bool signalIsOutputCapablePin(int pin) {
+#if WIRETAP_CARDPUTER_ADV
+    return signalIsSafeDigitalPin(pin) && pin != 4 && pin != 6 && pin != 13 && pin != 39;
+#else
     return signalIsSafeDigitalPin(pin) && !(pin >= 34 && pin <= 39);
+#endif
 }
 
 bool signalIsAdcCapablePin(int pin) {
+#if WIRETAP_CARDPUTER_ADV
+    static const int adcPins[] = {4, 5, 6, 8, 9};
+#else
     static const int adcPins[] = {0, 2, 4, 12, 13, 14, 15, 25, 26, 27, 32, 33, 34, 35, 36, 39};
+#endif
     for(size_t i = 0; i < sizeof(adcPins) / sizeof(adcPins[0]); i++) {
         if(pin == adcPins[i]) return true;
     }

@@ -2,6 +2,9 @@
 
 A feature-rich ESP32 implementation of a mini Bus Pirate-style electronics bench tool. WireTap-32 stays serial-first and dev-board friendly, with protocol tools, GPIO controls, simple signal analysis, and an optional OLED GPIO browser driven by three physical buttons.
 
+It also has a compile-time M5Stack Cardputer ADV profile that uses the built-in
+screen/keyboard and the EXT 2.54-14P header as the bench connector.
+
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-yellow.svg)](https://www.apache.org/licenses/LICENSE-2.0)
 [![Arduino](https://img.shields.io/badge/Arduino-Compatible-green.svg)](https://www.arduino.cc/)
 [![ESP32](https://img.shields.io/badge/ESP32-Compatible-blue.svg)](https://www.espressif.com/en/products/socs/esp32)
@@ -57,6 +60,7 @@ A feature-rich ESP32 implementation of a mini Bus Pirate-style electronics bench
 - **ESP32 Development Board** (any variant)
 - **USB Cable** for programming and serial communication
 - **3 tactile buttons** if you want the OLED menu navigation hardware
+- **M5Stack Cardputer ADV** if building the Cardputer profile
 
 ### Optional Display (Recommended)
 - **SSD1306 OLED Display** (128x64, 0.96", I2C interface)
@@ -72,6 +76,27 @@ Connect your target devices to the configurable GPIO pins (defaults shown):
 | UART | TX, RX | 17, 16 |
 | Display | SDA, SCL | 5, 4 |
 | Buttons | LEFT, CENTER, RIGHT | 34, 36, 39 |
+
+### M5Stack Cardputer ADV EXT Header
+
+The Cardputer build uses the EXT 2.54-14P header from the official pinout:
+
+| Role | GPIO |
+|---|---|
+| SPI SCK | G40 |
+| SPI MOSI | G14 |
+| SPI MISO | G39 |
+| SPI CS | G5 |
+| I2C SDA | G8 |
+| I2C SCL | G9 |
+| UART TX | G15 |
+| UART RX | G13 |
+| INT input | G4 |
+| BUSY input | G6 |
+
+G3 is reset and is reserved. 5VIN, 5VOUT, and GND are power rails, not GPIO.
+WireTap-32 still assumes 3.3V target signals; use level shifting for 5V
+hardware and keep grounds common.
 
 ### Bare ESP32 Limits
 
@@ -111,6 +136,14 @@ Arduino CLI users can compile with:
 
 ```bash
 arduino-cli compile --fqbn esp32:esp32:esp32 WireTap-32.ino
+```
+
+For the M5Stack Cardputer ADV:
+
+```bash
+FQBN='m5stack:esp32:m5stack_cardputer:FlashSize=8M,PartitionScheme=default_8MB,CDCOnBoot=cdc,USBMode=hwcdc'
+arduino-cli compile --fqbn "$FQBN" \
+  --build-property "build.extra_flags=-DESP32 -DWIRETAP_CARDPUTER_ADV=1" .
 ```
 
 ### 4. Connect and Use
@@ -197,6 +230,10 @@ When connected, the OLED display shows:
 - **Button Menu**: 3-button navigation for GPIO browsing and status screens
 
 The display updates every 500ms and can be toggled with `display on/off` commands. The physical buttons use `L/R` to navigate and `C` to select, toggle, or return.
+
+On Cardputer ADV, use `,` or `;` / `W` / `K` for left, `.` or `/` / `S` /
+`J` for right, and `Enter`, `E`, space, or BtnA for select. USB serial remains
+the primary command interface.
 
 ## Technical Details
 

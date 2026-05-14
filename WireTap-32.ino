@@ -4,6 +4,10 @@
 // No external libs beyond Arduino core. Works on ESP32 Dev Module.
 
 // WiFi and WebServer includes removed for serial-only version
+#ifndef WIRETAP_CARDPUTER_ADV
+#define WIRETAP_CARDPUTER_ADV 0
+#endif
+
 #include <Wire.h>
 #include <SPI.h>
 #include <vector>
@@ -11,19 +15,114 @@
 #include <algorithm>
 #include <esp_system.h>
 #include <Preferences.h>
+#if WIRETAP_CARDPUTER_ADV
+#include <M5Cardputer.h>
+#include <CypherPuterReturn.h>
+namespace {
+constexpr uint8_t HID_USAGE_DOWN_ARROW = 0x51;
+constexpr uint8_t HID_USAGE_UP_ARROW = 0x52;
+constexpr uint8_t HID_USAGE_LEFT_ARROW = 0x50;
+constexpr uint8_t HID_USAGE_RIGHT_ARROW = 0x4F;
+constexpr uint8_t ARDUINO_KEY_DOWN_ARROW = 0xD9;
+constexpr uint8_t ARDUINO_KEY_UP_ARROW = 0xDA;
+constexpr uint8_t ARDUINO_KEY_LEFT_ARROW = 0xD8;
+constexpr uint8_t ARDUINO_KEY_RIGHT_ARROW = 0xD7;
+
+constexpr uint16_t WT_BG = 0x0000;
+constexpr uint16_t WT_PANEL = 0x1082;
+constexpr uint16_t WT_PANEL_2 = 0x2104;
+constexpr uint16_t WT_TEXT = 0xFFFF;
+constexpr uint16_t WT_MUTED = 0xA514;
+constexpr uint16_t WT_ACCENT = 0x07FF;
+constexpr uint16_t WT_GOOD = 0x07E0;
+constexpr uint16_t WT_WARN = 0xFD20;
+
+bool cardputerHidContains(const Keyboard_Class::KeysState& keys, uint8_t hidUsage, uint8_t arduinoKey) {
+    for(uint8_t key : keys.hid_keys) {
+        if(key == hidUsage || key == arduinoKey) return true;
+    }
+    return false;
+}
+}
+#else
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#endif
 #include "src/SignalTools.h"
 #include "src/PinSafety.h"
 
+static void wireTapReturnToLauncher(uint32_t delayMs) {
+#if WIRETAP_CARDPUTER_ADV
+    cypherPuterReturnToLauncher(delayMs);
+#else
+    delay(delayMs);
+    ESP.restart();
+#endif
+}
+
 // WiFi AP variables removed for serial-only version
 
-// -------- SSD1306 Display --------
+// -------- Display --------
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET -1
 #define SCREEN_ADDRESS 0x3C
+
+#if WIRETAP_CARDPUTER_ADV
+#ifndef SSD1306_SWITCHCAPVCC
+#define SSD1306_SWITCHCAPVCC 0
+#endif
+#ifndef SSD1306_WHITE
+#define SSD1306_WHITE 0xFFFF
+#endif
+#ifndef SSD1306_BLACK
+#define SSD1306_BLACK 0x0000
+#endif
+
+class WireTapCardputerDisplay : public Print {
+  public:
+    bool begin(uint8_t, uint8_t) {
+        auto cfg = M5.config();
+        cfg.fallback_board = m5::board_t::board_M5CardputerADV;
+        M5Cardputer.begin(cfg, true);
+        M5Cardputer.Display.setRotation(1);
+        M5Cardputer.Display.setBrightness(170);
+        M5Cardputer.Display.setTextWrap(false);
+        M5Cardputer.Display.fillScreen(SSD1306_BLACK);
+        return true;
+    }
+
+    size_t write(uint8_t c) override {
+        return M5Cardputer.Display.write(c);
+    }
+
+    void clearDisplay() {
+        M5Cardputer.Display.fillScreen(SSD1306_BLACK);
+    }
+
+    void display() {}
+
+    void setTextSize(uint8_t size) {
+        M5Cardputer.Display.setTextSize(size);
+    }
+
+    void setTextColor(uint16_t color) {
+        M5Cardputer.Display.setTextColor(color, SSD1306_BLACK);
+    }
+
+    void setTextColor(uint16_t color, uint16_t bg) {
+        M5Cardputer.Display.setTextColor(color, bg);
+    }
+
+    void setCursor(int16_t x, int16_t y) {
+        M5Cardputer.Display.setCursor(x, y);
+    }
+};
+
+WireTapCardputerDisplay display;
+#else
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+#endif
 bool displayEnabled = false;
 unsigned long lastDisplayUpdate = 0;
 TwoWire TargetWire(1);
@@ -67,20 +166,18 @@ String flushCapture() {
 enum Mode {HIZ, GPIO_MODE, I2C_MODE, SPI_MODE, UART_MODE};
 Mode mode = HIZ;
 
-// -------- OLED display bus pins (Wire, separate from TargetWire) --------
+// -------- Display and target bus pins --------
+#if WIRETAP_CARDPUTER_ADV
+int PIN_DISP_SDA = -1, PIN_DISP_SCL = -1;
+int PIN_I2C_SDA = 8, PIN_I2C_SCL = 9;
+int PIN_SPI_MOSI = 14, PIN_SPI_MISO = 39, PIN_SPI_SCK = 40, PIN_SPI_CS = 5;
+int PIN_UART_TX = 15, PIN_UART_RX = 13;
+#else
 int PIN_DISP_SDA = 5, PIN_DISP_SCL = 4;
-
-// -------- Command history --------
-#define CMD_HISTORY_SIZE 10
-String cmdHistory[CMD_HISTORY_SIZE];
-uint8_t cmdHistoryHead  = 0;
-uint8_t cmdHistoryCount = 0;
-int8_t  cmdHistoryPos   = -1;   // -1 = not browsing history
-
-// -------- Default pins --------
 int PIN_I2C_SDA = 21, PIN_I2C_SCL = 22;
 int PIN_SPI_MOSI = 23, PIN_SPI_MISO = 19, PIN_SPI_SCK = 18, PIN_SPI_CS = 5;
 int PIN_UART_TX = 17, PIN_UART_RX = 16;
+#endif
 uint32_t UART_BAUD = 115200;
 uint32_t UART_CONFIG = SERIAL_8N1;
 uint32_t I2C_FREQ = 100000;
@@ -89,10 +186,23 @@ uint8_t SPI_MODE_CFG = SPI_MODE0;
 uint8_t SPI_BIT_ORDER = MSBFIRST;
 bool I2C_PULLUPS = true;
 
+// -------- Command history --------
+#define CMD_HISTORY_SIZE 10
+String cmdHistory[CMD_HISTORY_SIZE];
+uint8_t cmdHistoryHead  = 0;
+uint8_t cmdHistoryCount = 0;
+int8_t  cmdHistoryPos   = -1;   // -1 = not browsing history
+
 // -------- OLED Button Menu --------
+#if WIRETAP_CARDPUTER_ADV
+static const int8_t BTN_LEFT_PIN = -1;
+static const int8_t BTN_CENTER_PIN = -1;
+static const int8_t BTN_RIGHT_PIN = -1;
+#else
 static const uint8_t BTN_LEFT_PIN = 34;
 static const uint8_t BTN_CENTER_PIN = 36;
 static const uint8_t BTN_RIGHT_PIN = 39;
+#endif
 static const unsigned long BUTTON_DEBOUNCE_MS = 50;
 static const unsigned long UI_REFRESH_MS = 500;
 
@@ -104,18 +214,25 @@ enum UiScreen {
 
 enum MainMenuItem {
     MENU_GPIO = 0,
-    MENU_STATUS = 1
+    MENU_STATUS = 1,
+    MENU_RETURN = 2
 };
 
+#if WIRETAP_CARDPUTER_ADV
+static const uint8_t GPIO_MENU_PINS[] = {
+    4, 6, 8, 9, 13, 14, 15, 39, 40, 5
+};
+#else
 static const uint8_t GPIO_MENU_PINS[] = {
     0, 2, 12, 13, 14, 15, 16, 17, 18,
     19, 21, 22, 23, 25, 26, 32, 33
 };
+#endif
 static const uint8_t GPIO_MENU_PIN_COUNT = sizeof(GPIO_MENU_PINS) / sizeof(GPIO_MENU_PINS[0]);
 static const uint8_t GPIO_MENU_EXIT_INDEX = GPIO_MENU_PIN_COUNT;
 
 struct Button {
-    uint8_t pin;
+    int8_t pin;
     bool lastRaw;
     bool stable;
     unsigned long lastChangeTime;
@@ -130,8 +247,10 @@ Button buttons[3] = {
 
 const char* mainMenuItems[] = {
     "GPIO",
-    "Status"
+    "Status",
+    "Launcher"
 };
+static const uint8_t MAIN_MENU_COUNT = sizeof(mainMenuItems) / sizeof(mainMenuItems[0]);
 
 UiScreen uiScreen = UI_MAIN_MENU;
 uint8_t mainMenuIndex = 0;
@@ -139,6 +258,9 @@ uint8_t gpioMenuIndex = 0;
 bool gpioMenuDriven[GPIO_MENU_PIN_COUNT] = {false};
 bool gpioMenuState[GPIO_MENU_PIN_COUNT] = {false};
 bool screenDirty = true;
+#if WIRETAP_CARDPUTER_ADV
+bool uiBackEvent = false;
+#endif
 
 // -------- Mode state helpers --------
 bool uartBridgeActive = false;
@@ -165,6 +287,9 @@ void initButtons();
 void updateButtons();
 void handleButtonPresses();
 void initGpioMenuPins();
+void stopActivePeripherals();
+void setAllBusPinsInput();
+void returnToLauncherFromWireTap(uint32_t delayMs = 250);
 void serviceUARTRx();
 void serviceI2CSlave();
 void i2cMonitorStop(bool silent = false);
@@ -356,11 +481,20 @@ void displayInit() {
         display.setTextSize(1);
         display.setTextColor(SSD1306_WHITE);
         display.setCursor(0, 0);
+#if WIRETAP_CARDPUTER_ADV
+        display.println("WireTap-32");
+        display.println("Cardputer EXT");
+#else
         display.println("ESP32 Bus Pirate");
         display.println("v3.0 Buttons");
+#endif
         display.println("Starting...");
         display.display();
+#if WIRETAP_CARDPUTER_ADV
+        printSuccess("Cardputer display initialized");
+#else
         printSuccess("SSD1306 display initialized");
+#endif
     } else {
         displayEnabled = false;
         printWarning("SSD1306 display not found");
@@ -368,16 +502,56 @@ void displayInit() {
 }
 
 void renderMainMenu() {
+#if WIRETAP_CARDPUTER_ADV
+    auto& d = M5Cardputer.Display;
+    d.fillScreen(WT_BG);
+    d.fillRect(0, 0, d.width(), 24, 0x0186);
+    d.setTextSize(1);
+    d.setTextColor(WT_TEXT, 0x0186);
+    d.setCursor(8, 5);
+    d.print("WireTap-32");
+    d.setTextColor(WT_ACCENT, 0x0186);
+    d.setCursor(178, 5);
+    d.print("EXT BENCH");
+
+    d.setTextColor(WT_MUTED, WT_BG);
+    d.setCursor(8, 28);
+    d.print("3.3V only  ");
+    d.print(getModeName(mode));
+
+    for(uint8_t i = 0; i < MAIN_MENU_COUNT; i++) {
+        int16_t y = 42 + i * 26;
+        bool selected = i == mainMenuIndex;
+        uint16_t bg = selected ? WT_ACCENT : WT_PANEL;
+        uint16_t fg = selected ? WT_BG : WT_TEXT;
+        d.fillRoundRect(7, y, d.width() - 14, 22, 4, bg);
+        d.setTextColor(fg, bg);
+        d.setCursor(15, y + 7);
+        d.print(selected ? "> " : "  ");
+        d.print(mainMenuItems[i]);
+        d.setTextColor(selected ? WT_BG : WT_MUTED, bg);
+        d.setCursor(130, y + 7);
+        if(i == MENU_GPIO) d.print("browse/toggle pins");
+        else if(i == MENU_STATUS) d.print("mode + buffers");
+        else d.print("boot launcher");
+    }
+
+    d.fillRect(0, d.height() - 14, d.width(), 14, 0x1082);
+    d.setTextColor(WT_MUTED, 0x1082);
+    d.setCursor(8, d.height() - 11);
+    d.print("arrows/WASD move  Enter select  Del back");
+#else
     display.setTextSize(1);
     display.setCursor(0, 0);
     display.println("== MAIN MENU ==");
     display.println();
-    for(uint8_t i = 0; i < 2; i++) {
+    for(uint8_t i = 0; i < MAIN_MENU_COUNT; i++) {
         display.print(i == mainMenuIndex ? "> " : "  ");
         display.println(mainMenuItems[i]);
     }
     display.println();
     display.println("L/R:nav  C:select");
+#endif
 }
 
 const char* gpioMenuLabel(uint8_t index) {
@@ -386,6 +560,11 @@ const char* gpioMenuLabel(uint8_t index) {
     switch(pin) {
         case 0: return "IO0";
         case 2: return "IO2";
+        case 4: return "IO4";
+        case 5: return "IO5";
+        case 6: return "IO6";
+        case 8: return "IO8";
+        case 9: return "IO9";
         case 12: return "IO12";
         case 13: return "IO13";
         case 14: return "IO14";
@@ -401,6 +580,8 @@ const char* gpioMenuLabel(uint8_t index) {
         case 26: return "IO26";
         case 32: return "IO32";
         case 33: return "IO33";
+        case 39: return "IO39";
+        case 40: return "IO40";
         default: return "IO?";
     }
 }
@@ -416,13 +597,103 @@ const char* gpioMenuDriveLabel(uint8_t index) {
 }
 
 String gpioMenuHeader(uint8_t pin) {
+#if WIRETAP_CARDPUTER_ADV
+    switch(pin) {
+        case 4: return "EXT INT";
+        case 6: return "EXT BUSY";
+        case 8: return "EXT I2C SDA";
+        case 9: return "EXT I2C SCL";
+        case 13: return "EXT UART RX";
+        case 14: return "EXT SPI MOSI";
+        case 15: return "EXT UART TX";
+        case 39: return "EXT SPI MISO";
+        case 40: return "EXT SPI SCK";
+        case 5: return "EXT SPI CS";
+        default: return "EXT";
+    }
+#else
     if(pin == 23 || pin == 19 || pin == 18 || pin == 25 || pin == 26) return "H1";
     if(pin == 13 || pin == 12 || pin == 14 || pin == 15 || pin == 21 || pin == 22 || pin == 17 || pin == 16) return "H2";
     if(pin == 33 || pin == 32 || pin == 2 || pin == 0) return "H3";
     return "??";
+#endif
 }
 
 void renderGpioMenu() {
+#if WIRETAP_CARDPUTER_ADV
+    auto& d = M5Cardputer.Display;
+    d.fillScreen(WT_BG);
+    d.fillRect(0, 0, d.width(), 24, 0x0186);
+    d.setTextSize(1);
+    d.setTextColor(WT_TEXT, 0x0186);
+    d.setCursor(8, 5);
+    d.print("EXT GPIO");
+    d.setTextColor(WT_ACCENT, 0x0186);
+    d.setCursor(176, 5);
+    d.printf("%u/%u", min<uint8_t>(gpioMenuIndex + 1, GPIO_MENU_PIN_COUNT), GPIO_MENU_PIN_COUNT);
+
+    if(gpioMenuIndex >= GPIO_MENU_EXIT_INDEX) {
+        d.fillRoundRect(8, 39, d.width() - 16, 54, 6, WT_PANEL);
+        d.setTextSize(2);
+        d.setTextColor(WT_ACCENT, WT_PANEL);
+        d.setCursor(18, 51);
+        d.print("Back to Menu");
+        d.setTextSize(1);
+        d.setTextColor(WT_MUTED, WT_PANEL);
+        d.setCursor(18, 76);
+        d.print("Enter returns to the WireTap menu");
+    } else {
+        uint8_t pin = GPIO_MENU_PINS[gpioMenuIndex];
+        d.fillRoundRect(8, 32, 86, 70, 6, WT_PANEL);
+        d.setTextColor(WT_MUTED, WT_PANEL);
+        d.setCursor(18, 40);
+        d.print(gpioMenuHeader(pin));
+        d.setTextSize(3);
+        d.setTextColor(WT_ACCENT, WT_PANEL);
+        d.setCursor(18, 55);
+        d.print("G");
+        d.print(pin);
+        d.setTextSize(1);
+        d.setTextColor(WT_TEXT, WT_PANEL);
+        d.setCursor(18, 88);
+        d.print(gpioMenuStateLabel(gpioMenuIndex));
+        d.print(" ");
+        d.print(gpioMenuDriveLabel(gpioMenuIndex));
+
+        d.fillRoundRect(102, 32, d.width() - 110, 70, 6, WT_PANEL_2);
+        d.setTextColor(WT_TEXT, WT_PANEL_2);
+        d.setCursor(112, 42);
+        d.print(signalIsOutputCapablePin(pin) ? "Output capable" : "Input/read only");
+        d.setTextColor(WT_MUTED, WT_PANEL_2);
+        d.setCursor(112, 58);
+        if(pin == PIN_I2C_SDA || pin == PIN_I2C_SCL) d.print("I2C default line");
+        else if(pin == PIN_SPI_MOSI || pin == PIN_SPI_MISO || pin == PIN_SPI_SCK || pin == PIN_SPI_CS) d.print("SPI default line");
+        else if(pin == PIN_UART_TX || pin == PIN_UART_RX) d.print("UART default line");
+        else d.print("General EXT signal");
+        d.setCursor(112, 76);
+        d.print("Enter toggles outputs");
+        d.setCursor(112, 88);
+        d.print("Pins check in serial");
+    }
+
+    d.fillRect(0, 106, d.width(), 15, WT_BG);
+    uint8_t first = gpioMenuIndex > 2 ? gpioMenuIndex - 2 : 0;
+    if(first + 5 > GPIO_MENU_PIN_COUNT + 1) first = max<int16_t>(0, GPIO_MENU_PIN_COUNT + 1 - 5);
+    for(uint8_t i = 0; i < 5 && first + i <= GPIO_MENU_EXIT_INDEX; i++) {
+        uint8_t idx = first + i;
+        int16_t x = 8 + i * 45;
+        bool selected = idx == gpioMenuIndex;
+        d.fillRoundRect(x, 107, 38, 14, 3, selected ? WT_ACCENT : WT_PANEL);
+        d.setTextColor(selected ? WT_BG : WT_MUTED, selected ? WT_ACCENT : WT_PANEL);
+        d.setCursor(x + 4, 110);
+        d.print(gpioMenuLabel(idx));
+    }
+
+    d.fillRect(0, d.height() - 14, d.width(), 14, 0x1082);
+    d.setTextColor(WT_MUTED, 0x1082);
+    d.setCursor(8, d.height() - 11);
+    d.print("arrows/WASD browse  Enter toggle  Del menu");
+#else
     display.setTextSize(1);
     display.setCursor(0, 0);
     display.println("== GPIO ==");
@@ -451,6 +722,7 @@ void renderGpioMenu() {
     display.println();
     display.println("L/R: browse");
     display.println("C: toggle");
+#endif
 }
 
 void renderCurrentScreen() {
@@ -480,6 +752,39 @@ void displayUpdate() {
 }
 
 void renderStatusView() {
+#if WIRETAP_CARDPUTER_ADV
+    auto& d = M5Cardputer.Display;
+    d.fillScreen(WT_BG);
+    d.fillRect(0, 0, d.width(), 24, 0x0186);
+    d.setTextSize(1);
+    d.setTextColor(WT_TEXT, 0x0186);
+    d.setCursor(8, 5);
+    d.print("WireTap Status");
+    d.setTextColor(WT_ACCENT, 0x0186);
+    d.setCursor(176, 5);
+    d.print(getModeName(mode));
+
+    auto card = [&](int16_t x, int16_t y, int16_t w, const char* label, const String& value, uint16_t color) {
+        d.fillRoundRect(x, y, w, 32, 5, WT_PANEL);
+        d.setTextColor(WT_MUTED, WT_PANEL);
+        d.setCursor(x + 7, y + 6);
+        d.print(label);
+        d.setTextColor(color, WT_PANEL);
+        d.setCursor(x + 7, y + 19);
+        d.print(value);
+    };
+
+    card(8, 34, 70, "HEAP", String(ESP.getFreeHeap() / 1024) + " KB", WT_GOOD);
+    card(86, 34, 70, "UPTIME", String(millis() / 1000) + " s", WT_TEXT);
+    card(164, 34, 68, "UART RX", String(uart_avail()) + " B", uart_avail() ? WT_WARN : WT_MUTED);
+    card(8, 74, 108, "I2C", "G" + String(PIN_I2C_SDA) + "/G" + String(PIN_I2C_SCL) + " " + String(I2C_FREQ / 1000) + "k", mode == I2C_MODE ? WT_ACCENT : WT_TEXT);
+    card(124, 74, 108, "SPI", "G" + String(PIN_SPI_SCK) + "/G" + String(PIN_SPI_MOSI) + "/G" + String(PIN_SPI_MISO), mode == SPI_MODE ? WT_ACCENT : WT_TEXT);
+
+    d.fillRect(0, d.height() - 14, d.width(), 14, 0x1082);
+    d.setTextColor(WT_MUTED, 0x1082);
+    d.setCursor(8, d.height() - 11);
+    d.print("any key returns to menu  Q/Tab launcher");
+#else
     display.setTextSize(1);
     display.setCursor(0, 0);
     display.println("== STATUS ==");
@@ -497,6 +802,7 @@ void renderStatusView() {
     display.println("B");
     display.setCursor(0, 56);
     display.println("Any key: back");
+#endif
 }
 
 void initGpioMenuPins() {
@@ -515,6 +821,11 @@ void toggleSelectedGpio() {
     }
 
     uint8_t pin = GPIO_MENU_PINS[gpioMenuIndex];
+    if(!signalIsOutputCapablePin(pin)) {
+        printWarning("GPIO" + String(pin) + " is input-only or reserved on this profile");
+        setScreenDirty();
+        return;
+    }
     bool nextState = !gpioMenuState[gpioMenuIndex];
     pinMode(pin, OUTPUT);
     digitalWrite(pin, nextState ? HIGH : LOW);
@@ -527,24 +838,46 @@ void handleButtonPresses() {
     bool left = buttons[0].pressEvent;
     bool center = buttons[1].pressEvent;
     bool right = buttons[2].pressEvent;
+#if WIRETAP_CARDPUTER_ADV
+    bool back = uiBackEvent;
+    uiBackEvent = false;
+#else
+    bool back = false;
+#endif
 
-    if(!left && !center && !right) return;
+    if(!left && !center && !right && !back) return;
 
     if(uiScreen == UI_MAIN_MENU) {
+        if(back) {
+            display.clearDisplay();
+            display.setCursor(0, 0);
+            display.println("Returning to");
+            display.println("Cypher Putter OS");
+            display.display();
+            returnToLauncherFromWireTap(500);
+            return;
+        }
         if(left) {
-            mainMenuIndex = (mainMenuIndex + 1) % 2;
+            mainMenuIndex = (mainMenuIndex + MAIN_MENU_COUNT - 1) % MAIN_MENU_COUNT;
             setScreenDirty();
         }
         if(right) {
-            mainMenuIndex = (mainMenuIndex + 1) % 2;
+            mainMenuIndex = (mainMenuIndex + 1) % MAIN_MENU_COUNT;
             setScreenDirty();
         }
         if(center) {
             if(mainMenuIndex == MENU_GPIO) {
                 uiScreen = UI_GPIO_MENU;
                 gpioMenuIndex = 0;
-            } else {
+            } else if(mainMenuIndex == MENU_STATUS) {
                 uiScreen = UI_STATUS_VIEW;
+            } else {
+                display.clearDisplay();
+                display.setCursor(0, 0);
+                display.println("Returning to");
+                display.println("Cypher Putter OS");
+                display.display();
+                returnToLauncherFromWireTap(500);
             }
             setScreenDirty();
         }
@@ -553,6 +886,13 @@ void handleButtonPresses() {
     }
 
     if(uiScreen == UI_GPIO_MENU) {
+        if(back) {
+            uiScreen = UI_MAIN_MENU;
+            mainMenuIndex = MENU_GPIO;
+            setScreenDirty();
+            displayUpdate();
+            return;
+        }
         if(left) {
             gpioMenuIndex = (gpioMenuIndex + GPIO_MENU_PIN_COUNT) % (GPIO_MENU_PIN_COUNT + 1);
             setScreenDirty();
@@ -569,6 +909,10 @@ void handleButtonPresses() {
     }
 
     if(uiScreen == UI_STATUS_VIEW) {
+        if(back && uiScreen == UI_STATUS_VIEW) {
+            returnToLauncherFromWireTap(250);
+            return;
+        }
         uiScreen = UI_MAIN_MENU;
         mainMenuIndex = MENU_GPIO;
         setScreenDirty();
@@ -593,6 +937,12 @@ void setAllBusPinsInput() {
     pinMode(PIN_SPI_CS, INPUT);
     pinMode(PIN_UART_TX, INPUT);
     pinMode(PIN_UART_RX, INPUT);
+}
+
+void returnToLauncherFromWireTap(uint32_t delayMs) {
+    stopActivePeripherals();
+    setAllBusPinsInput();
+    wireTapReturnToLauncher(delayMs);
 }
 
 void setHiZ() {
@@ -1735,6 +2085,11 @@ void uartConfigCmd(const std::vector<String>& v) {
 }
 
 void initButtons() {
+#if WIRETAP_CARDPUTER_ADV
+    for(uint8_t i = 0; i < 3; i++) {
+        buttons[i].pressEvent = false;
+    }
+#else
     for(uint8_t i = 0; i < 3; i++) {
         pinMode(buttons[i].pin, INPUT);
         buttons[i].lastRaw = digitalRead(buttons[i].pin);
@@ -1742,9 +2097,52 @@ void initButtons() {
         buttons[i].lastChangeTime = millis();
         buttons[i].pressEvent = false;
     }
+#endif
 }
 
 void updateButtons() {
+#if WIRETAP_CARDPUTER_ADV
+    for(uint8_t i = 0; i < 3; i++) {
+        buttons[i].pressEvent = false;
+    }
+    uiBackEvent = false;
+
+    M5Cardputer.update();
+    bool left = false;
+    bool center = M5Cardputer.BtnA.wasClicked();
+    bool right = false;
+    bool back = false;
+
+    if(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()) {
+        Keyboard_Class::KeysState keys = M5Cardputer.Keyboard.keysState();
+        center = center || keys.enter || keys.space;
+        back = back || keys.del || keys.tab;
+        left = left || cardputerHidContains(keys, HID_USAGE_UP_ARROW, ARDUINO_KEY_UP_ARROW);
+        left = left || cardputerHidContains(keys, HID_USAGE_LEFT_ARROW, ARDUINO_KEY_LEFT_ARROW);
+        right = right || cardputerHidContains(keys, HID_USAGE_DOWN_ARROW, ARDUINO_KEY_DOWN_ARROW);
+        right = right || cardputerHidContains(keys, HID_USAGE_RIGHT_ARROW, ARDUINO_KEY_RIGHT_ARROW);
+        for(auto c : keys.word) {
+            if(c == ',' || c == ';' || c == 'w' || c == 'W' || c == 'k' || c == 'K' ||
+               c == 'a' || c == 'A' || c == 'h' || c == 'H') left = true;
+            if(c == '.' || c == '/' || c == 's' || c == 'S' || c == 'j' || c == 'J' ||
+               c == 'd' || c == 'D' || c == 'l' || c == 'L') right = true;
+            if(c == ' ' || c == 'e' || c == 'E') center = true;
+            if(c == '`' || c == 'q' || c == 'Q' || c == 'b' || c == 'B') back = true;
+        }
+
+        for(const auto& key : M5Cardputer.Keyboard.keyList()) {
+            if(key.y == 3 && key.x == 10) left = true;
+            if(key.y == 3 && key.x == 12) right = true;
+            if(key.y == 2 && key.x == 11) left = true;
+            if(key.y == 3 && key.x == 11) right = true;
+        }
+    }
+
+    buttons[0].pressEvent = left;
+    buttons[1].pressEvent = center;
+    buttons[2].pressEvent = right;
+    uiBackEvent = back;
+#else
     unsigned long now = millis();
 
     for(uint8_t i = 0; i < 3; i++) {
@@ -1767,6 +2165,7 @@ void updateButtons() {
             buttons[i].stable = raw;
         }
     }
+#endif
 }
 
 // -------- UART RX buffer - FIXED --------
@@ -2172,17 +2571,31 @@ void help() {
     println("  config reset  - Erase saved config from flash");
     println("");
     println("TIPS:");
+#if WIRETAP_CARDPUTER_ADV
+    println("  Cardputer nav: ,/; or W/K = left, ./ or S/J = right, Enter/BtnA = select");
+    println("  Launcher menu item, launcher, or return goes back to Cypher Putter OS");
+    println("  EXT pins: SPI 40/14/39/5, I2C 8/9, UART TX15 RX13. 3.3V logic only.");
+#endif
     println("  Backspace works  |  Up/Down arrows browse command history");
     println("  <Enter> repeats last command  |  3.3V max, 12mA max per pin");
 }
 
 void showPins() {
     println("=== Pin Assignments ===");
+#if WIRETAP_CARDPUTER_ADV
+    println("Display: built-in M5Stack Cardputer ST7789 + TCA8418 keyboard");
+    println("EXT: reset=G3 reserved, INT=G4 input, BUSY=G6 input, 5VIN/5VOUT/GND are not GPIO");
+#else
     println("DISP: SDA=" + String(PIN_DISP_SDA) + "  SCL=" + String(PIN_DISP_SCL) + "  (OLED Wire bus)");
+#endif
     println("I2C:  SDA=" + String(PIN_I2C_SDA)  + "  SCL=" + String(PIN_I2C_SCL)  + "  Freq=" + String(I2C_FREQ/1000) + "kHz  Pullups=" + String(I2C_PULLUPS ? "ON" : "OFF"));
     println("SPI:  MOSI=" + String(PIN_SPI_MOSI) + " MISO=" + String(PIN_SPI_MISO) + " SCK=" + String(PIN_SPI_SCK) + " CS=" + String(PIN_SPI_CS) + "  Freq=" + String(SPI_FREQ/1000) + "kHz");
     println("UART: RX=" + String(PIN_UART_RX) + "    TX=" + String(PIN_UART_TX) + "    Baud=" + String(UART_BAUD));
+#if WIRETAP_CARDPUTER_ADV
+    println("Use 'pins set <name> <pin>' — names: sda,scl,mosi,miso,sck,cs,tx,rx");
+#else
     println("Use 'pins set <name> <pin>' — names: sda,scl,mosi,miso,sck,cs,tx,rx,disp-sda,disp-scl");
+#endif
 }
 
 void showStatus() {
@@ -2339,6 +2752,11 @@ void handleCmd(const String& line) {
 
     if(c=="help"||c=="?"||c=="h") { help(); return; }
     if(c=="status"||c=="stat"||c=="s") { showStatus(); return; }
+    if(c=="launcher"||c=="return") {
+        printInfo("Returning to Cypher Putter OS");
+        returnToLauncherFromWireTap(250);
+        return;
+    }
 
     // Special commands
     if(c=="colors"||c=="color") {
@@ -2425,6 +2843,17 @@ void handleCmd(const String& line) {
             int p=v[3].toInt();
             String name = v[2];
             name.toLowerCase();
+#if WIRETAP_CARDPUTER_ADV
+            if(name == "disp-sda" || name == "disp-scl") {
+                println("ERROR: Cardputer display is built in; display pins are not configurable.");
+                return;
+            }
+            if(!signalIsValidGpio(p)) {
+                println("ERROR: GPIO" + String(p) + " is not on the Cardputer EXT header.");
+                println("EXT GPIOs: 4,5,6,8,9,13,14,15,39,40. G3 reset is reserved.");
+                return;
+            }
+#endif
             if(name=="sda") PIN_I2C_SDA=p;
             else if(name=="scl") PIN_I2C_SCL=p;
             else if(name=="mosi") PIN_SPI_MOSI=p;
@@ -2914,11 +3343,17 @@ void handleInputStream(Stream& s) {
 void setup() {
     // Disable watchdog during setup (commented out to avoid WDT errors)
     // disableCore0WDT();
+#if !WIRETAP_CARDPUTER_ADV
     Wire.begin(PIN_DISP_SDA, PIN_DISP_SCL);
+#endif
     USB.begin(115200);
     delay(2000); // Longer delay for stability
     
+#if WIRETAP_CARDPUTER_ADV
+    USB.println("\n=== WireTap-32 Cardputer EXT Bench ===");
+#else
     USB.println("\n=== ESP32 Bus Pirate v3.0 (Serial-Only) ===");
+#endif
     USB.println("Free heap: " + String(ESP.getFreeHeap()));
 
     // Initialize in safe order
